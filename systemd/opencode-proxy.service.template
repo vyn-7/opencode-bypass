@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenCode free-tier OpenAI SSE proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@PROJECT_DIR@/.venv/bin/python @PROJECT_DIR@/opencode_proxy.py --port @PORT@
+Restart=on-failure
+RestartSec=5
+# SIGTERM-clean shutdown so no zombie holds the port
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

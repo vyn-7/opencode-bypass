@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencode-bypass"
+version = "3.0.0"
+description = "OpenAI-shaped SSE proxy that tunnels OpenCode free-tier models through the local OpenCode CLI (Linux/macOS/Windows)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["aiohttp>=3.9"]
+
+[project.scripts]
+opencode-bypass = "opencode_proxy:main"
+
+[tool.setuptools]
+py-modules = ["opencode_proxy"]

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+opencode-proxy.log
+*.log
+*.err
+.env
+dist/
+build/
+*.egg-info/
