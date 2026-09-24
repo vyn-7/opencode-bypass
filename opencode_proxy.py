@@ -36,11 +36,18 @@ Agentic tool calling (Hermes / any OpenAI client):
   ``tool_choice`` are never forwarded as prompt-body ``tools`` (that would
   also trip the free-tier 403 gate). Instead they are rendered into a
   ``[client tools]`` prompt section, the agent instructs the model to emit
-  ``[tool_call]\\n{json}\\n[/tool_call]`` blocks, and the proxy converts
-  those blocks into standard OpenAI ``tool_calls`` (blocking + streaming).
-  A request-level hash of the effective tools + tool_choice rides along the
-  digest entry, so a changed client-tool contract forces a resync instead of
-  silently reusing a session staged for the old tools.
+  ``<tool_call>\\n{json}\\n</tool_call>`` blocks (preferred, closer to MiMo's
+  native trained format; legacy ``[tool_call]...[/tool_call]`` still
+  accepted), and the proxy converts those blocks into standard OpenAI
+  ``tool_calls`` (blocking + streaming). Both serializations normalize to
+  the same internal representation: exactly one JSON object per block
+  (``{"name": ..., "arguments": {...}}``), no markdown fences, no wrapper
+  text inside the block. Incomplete blocks are buffered until the matching
+  close tag arrives and never leak into visible content; malformed JSON is
+  kept verbatim as content, never exposed as a tool call. A request-level
+  hash of the effective tools + tool_choice rides along the digest entry,
+  so a changed client-tool contract forces a resync instead of silently
+  reusing a session staged for the old tools.
 
 Reasoning (OpenCode ``reasoning`` parts <-> OpenAI ``reasoning_content``):
 
@@ -53,6 +60,16 @@ Reasoning (OpenCode ``reasoning`` parts <-> OpenAI ``reasoning_content``):
   arrive *before* ``message.part.updated`` (opencode#26924), dedups
   snapshot/delta overlap, and reasoning never terminates a stream: the
   finish reason still follows the final content or tool_calls turn.
+  Multi-turn tool use preserves prior ``reasoning_content`` in the backend
+  context as a separate ``[assistant reasoning]...[/assistant reasoning]``
+  section — never merged into visible ``[assistant]`` text, never written
+  to persistent memory, never stored as a separate digest-registry memory
+  object. The backend session natively retains the previous reasoning +
+  text-with-tool-call output, so delta prompts carry only the new tail
+  (assistant replay with IDs + tool result); the model thus receives prior
+  reasoning exactly once per continuation without redundant second
+  assistant events, while generated OpenAI call IDs survive unchanged for
+  tool-result association.
 
 Error semantics (never fabricate an answer):
 
@@ -130,13 +147,37 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 TOOL_OPEN = "[tool_call]"
 TOOL_CLOSE = "[/tool_call]"
+# Preferred XML-style serialization (closer to MiMo's native trained format).
+# The parser accepts BOTH formats and normalizes them into the same internal
+# OpenAI tool-call representation. Do NOT remove the bracket syntax yet.
+TOOL_OPEN_BRACKET = "[tool_call]"
+TOOL_CLOSE_BRACKET = "[/tool_call]"
+TOOL_OPEN_XML = "<tool_call>"
+TOOL_CLOSE_XML = "</tool_call>"
+# Ordered preferred-first: XML is tried first when scanning for the next block.
+_TOOL_MARKERS: tuple[tuple[str, str], ...] = (
+    (TOOL_OPEN_XML, TOOL_CLOSE_XML),
+    (TOOL_OPEN_BRACKET, TOOL_CLOSE_BRACKET),
+)
 
 _models_cache: dict = {"at": 0.0, "ids": None}
+
+# Detailed tool-call diagnostics are gated behind this flag so normal runs
+# stay quiet. Enabled via --debug or OPENCODE_PROXY_DEBUG=1. Never logs API
+# keys, credentials, or arbitrary environment variables — only protocol
+# metadata (counts, names, ids, booleans, finish reasons, transport/mode).
+DEBUG = os.environ.get("OPENCODE_PROXY_DEBUG", "").lower() in (
+    "1", "true", "yes", "on")
 
 
 def log(msg: str) -> None:
     ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[proxy {ts}] {msg}", flush=True)
+
+
+def debug_log(msg: str) -> None:
+    if DEBUG:
+        log(f"[debug] {msg}")
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +304,33 @@ def _text_of(content) -> str:
     return str(content)
 
 
+def _reasoning_of_msg(m: dict) -> str:
+    """Extract assistant reasoning_content without merging into visible text.
+
+    Hermes sends prior thinking as ``reasoning_content`` (alias ``reasoning``
+    accepted). Returns "" when absent. Never returns visible content.
+    """
+    if not isinstance(m, dict):
+        return ""
+    val = m.get("reasoning_content")
+    if val is None:
+        val = m.get("reasoning")
+    if isinstance(val, str):
+        return val if val.strip() else ""
+    if isinstance(val, list):
+        # Multipart-style reasoning: join text parts, ignore non-text.
+        chunks: list[str] = []
+        for p in val:
+            if isinstance(p, dict) and isinstance(p.get("text"), str) \
+                    and p["text"]:
+                chunks.append(p["text"])
+            elif isinstance(p, str) and p:
+                chunks.append(p)
+        joined = "".join(chunks)
+        return joined if joined.strip() else ""
+    return ""
+
+
 def _render_tool_calls(tool_calls) -> str:
     """Render assistant tool_calls so the model remembers what it did.
 
@@ -271,6 +339,7 @@ def _render_tool_calls(tool_calls) -> str:
     The generated call id is preserved verbatim (when present) so it
     matches the ``[tool result: ...] (call call_...)`` label of the next
     turn — ids are protocol state, never regenerated on replay.
+    Ordering of tool_calls is preserved as received.
     """
     rendered = []
     for tc in tool_calls or []:
@@ -298,9 +367,17 @@ def flatten_history(msgs) -> str:
     """Flatten the conversation into one labeled transcript. No size budget.
 
     Every turn is preserved in order: system (+developer), user, assistant
-    (content AND tool calls), tool results (with tool name / call id when
-    provided). Empty turns carry no information and are skipped. Nothing is
-    ever truncated — Hermes' ``messages`` array is authoritative.
+    (reasoning + content + tool calls), tool results (with tool name / call
+    id when provided). Reasoning is kept strictly separate from visible
+    content as ``[assistant reasoning]...[/assistant reasoning]`` — never
+    merged into ``[assistant]`` text, never written to persistent memory,
+    never stored as a separate digest-registry memory object. Its purpose
+    is strictly to preserve model context for the next reasoning/tool turn
+    (MiMo API: previous reasoning_content is retained during multi-turn
+    tool use). Empty turns carry no information and are skipped — but an
+    assistant tool-call message with empty ``content`` is NOT empty when it
+    carries tool_calls or reasoning. Nothing is ever truncated — Hermes'
+    ``messages`` array is authoritative.
     """
     blocks: list[tuple[bool, str]] = []  # (is_system, text)
     for m in msgs or []:
@@ -312,13 +389,20 @@ def flatten_history(msgs) -> str:
             if text:
                 blocks.append((True, f"[system]\n{text}"))
         elif role == "assistant":
+            reasoning = _reasoning_of_msg(m)
             calls = _render_tool_calls(m.get("tool_calls"))
+            if reasoning:
+                blocks.append(
+                    (False,
+                     f"[assistant reasoning]\n{reasoning}\n[/assistant reasoning]"))
             if text and calls:
                 blocks.append((False, f"[assistant]\n{text}\n{calls}"))
             elif text:
                 blocks.append((False, f"[assistant]\n{text}"))
             elif calls:
                 blocks.append((False, f"[assistant]\n{calls}"))
+            elif not reasoning:
+                continue  # truly empty assistant turn: skip
         elif role == "tool":
             name = m.get("name", "")
             tcid = m.get("tool_call_id", "")
@@ -362,7 +446,23 @@ def digests_of(msgs) -> list[str]:
 
 
 def drop_echoed_assistant(tail_msgs, last_reply: str):
-    """Drop a leading assistant echo of our previous reply (backend has it)."""
+    """Drop a leading assistant echo of our previous reply (backend has it).
+
+    The backend session natively retains the previous turn's reasoning part
+    + text part containing ``<tool_call>`` (or legacy ``[tool_call]``), so
+    the delta must not recreate a redundant second assistant event for the
+    same turn. However:
+
+    * a turn carrying ``tool_calls`` is NEVER dropped — its OpenAI call IDs
+      are protocol state that does not exist in the backend's original
+      textual output and must survive verbatim for tool-result association;
+    * a turn carrying ``reasoning_content`` is NEVER dropped on content
+      equality alone — ``last_reply`` is content-only (reasoning never
+      stored) so dropping would discard prior thinking that the next
+      reasoning/tool turn needs;
+    * an assistant tool-call message with empty ``content`` is NOT empty
+      when it carries tool_calls/reasoning and must not be discarded.
+    """
     if not tail_msgs or not last_reply:
         return tail_msgs
     head = tail_msgs[0]
@@ -370,6 +470,8 @@ def drop_echoed_assistant(tail_msgs, last_reply: str):
         return tail_msgs
     if head.get("tool_calls"):
         return tail_msgs  # never drop turns that carry tool calls
+    if _reasoning_of_msg(head):
+        return tail_msgs  # reasoning preserved; backend echo-skip is content-only
     if _text_of(head.get("content", "")).strip() == last_reply.strip():
         return tail_msgs[1:]
     return tail_msgs
@@ -443,6 +545,19 @@ def plan_prompt(msgs, entry: dict | None) -> tuple[str, str, dict]:
     Returns (prompt_text, mode, record_payload). ``record_payload`` always
     carries the full incoming digest list — the caller records it only
     after a successful completion (retries then replay the same tail).
+
+    Backend-session accounting (explicit): after the previous model
+    response the ``opencode serve`` session natively stores the reasoning
+    part + the text part containing the textual ``<tool_call>`` (or legacy
+    ``[tool_call]``) block. The next delta therefore primarily provides
+    the tool result (+ new information) with the OpenAI call ID preserved
+    in the textual replay (``(call call_...)``) so the relationship stays
+    unambiguous — it does NOT create a redundant second assistant event
+    in the backend session (prompts travel as user text, not as new
+    assistant messages). The prior reasoning thus reaches the model
+    exactly once per continuation: once natively in the session prefix,
+    once quoted in the delta tail when it is genuinely new (never
+    duplicated from the stored prefix, never merged into visible text).
     """
     digs = digests_of(msgs)
     if entry is None:
@@ -491,6 +606,62 @@ def lookup_entry(registry: "Registry", digests: list[str], backend_kind: str,
     return entry
 
 
+def _incoming_has_reasoning(msgs) -> bool:
+    """Whether the incoming Hermes request replays prior reasoning_content."""
+    for m in msgs or []:
+        if isinstance(m, dict) and m.get("role") == "assistant" \
+                and _reasoning_of_msg(m):
+            return True
+    return False
+
+
+def _debug_tool_turn(*, model: str, transport: str, mode: str,
+                     tools_list, tool_choice, raw: str,
+                     calls: list[dict], reasoning: str,
+                     incoming_msgs) -> None:
+    """Detailed per-turn diagnostics behind the debug flag (no secrets).
+
+    Logs: client-tools present/count, tool_choice, backend model/transport,
+    whether the backend emitted <tool_call> / [tool_call], parser result
+    (count), generated IDs + function names + arg-parse success, finish
+    reason, reasoning present, next-request reasoning present, resync/delta.
+    Never logs API keys, credentials, env vars, or full argument values
+    (only names/ids/booleans/counts).
+    """
+    if not DEBUG:
+        return
+    try:
+        has_tools = bool(tools_list)
+        n_tools = len(tools_list) if isinstance(tools_list, list) else 0
+        emitted_xml = TOOL_OPEN_XML in (raw or "")
+        emitted_bracket = TOOL_OPEN_BRACKET in (raw or "")
+        finish = "tool_calls" if calls else "stop"
+        has_reasoning = bool((reasoning or "").strip())
+        incoming_reasoning = _incoming_has_reasoning(incoming_msgs)
+        names: list[str] = []
+        ids: list[str] = []
+        for c in calls or []:
+            fn = (c.get("function") or {}) if isinstance(c, dict) else {}
+            names.append(str(fn.get("name", "?")))
+            ids.append(str(c.get("id", "?") if isinstance(c, dict) else "?"))
+        # Arg-parse success: every emitted call parsed exactly one JSON
+        # object (guaranteed by _parse_tool_call_body); malformed blocks
+        # never become calls.
+        arg_ok = bool(calls)  # True when at least one call parsed
+        debug_log(
+            f"tool-turn model={model} transport={transport} mode={mode} "
+            f"client_tools={has_tools} n_tools={n_tools} "
+            f"tool_choice={json.dumps(tool_choice, default=str)} "
+            f"emitted_xml={emitted_xml} emitted_bracket={emitted_bracket} "
+            f"parser_calls={len(calls or [])} ids={ids} names={names} "
+            f"args_parse_ok={arg_ok} finish={finish} "
+            f"reasoning_present={has_reasoning} "
+            f"incoming_reasoning={incoming_reasoning}"
+        )
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # OpenAI tools <-> [tool_call] protocol bridge
 # --------------------------------------------------------------------------
@@ -519,7 +690,12 @@ def effective_tools(tools, tool_choice=None) -> list[dict]:
 
 
 def format_client_tools(tools: list[dict], tool_choice=None) -> str:
-    """Render OpenAI function tools as a prompt section for the model."""
+    """Render OpenAI function tools as a prompt section for the model.
+
+    Preferred serialization is XML-style ``<tool_call>`` (closer to MiMo's
+    native trained format); legacy ``[tool_call]`` remains accepted for
+    backward compatibility but the model is taught to emit XML first.
+    """
     if not tools:
         return ""
     lines = ["[client tools]"]
@@ -539,18 +715,24 @@ def format_client_tools(tools: list[dict], tool_choice=None) -> str:
         lines.append(f"  parameters: {params_s}")
     lines.append("")
     lines.append(
-        "To invoke a tool, emit one fenced block per call and no other markup "
+        "To invoke a tool, emit one XML block per call and no other markup "
         "around it. arguments must be a JSON object matching that tool's "
         "parameters schema:"
     )
-    lines.append(TOOL_OPEN)
-    lines.append('{"name": "tool_name", "arguments": { /* ... */ }}')
-    lines.append(TOOL_CLOSE)
+    lines.append(TOOL_OPEN_XML)
+    lines.append('{"name": "tool_name", "arguments": {"key": "value"}}')
+    lines.append(TOOL_CLOSE_XML)
     lines.append(
-        "Rules: one block per tool call; you may include normal text before "
-        "or after blocks; never invent tools that are not listed above; "
-        "never call the backend's built-in tool runner — the proxy translates "
-        "these blocks into the client's tool_calls format."
+        "Rules: exactly one JSON object per tool call; one block per tool "
+        "call; you may include normal text before or after blocks; do not "
+        "use markdown fences around the tool call; do not emit additional "
+        "wrapper text inside the tool-call block; never invent tools that "
+        "are not listed above; never call the backend's built-in tool "
+        "runner — the proxy translates these blocks into the client's "
+        "OpenAI tool_calls format. "
+        f"Legacy {TOOL_OPEN_BRACKET}...{TOOL_CLOSE_BRACKET} syntax is still "
+        "accepted for backward compatibility, but prefer "
+        f"{TOOL_OPEN_XML}...{TOOL_CLOSE_XML}."
     )
     if tool_choice == "required":
         lines.append("You MUST emit at least one tool_call block this turn.")
@@ -562,7 +744,14 @@ def format_client_tools(tools: list[dict], tool_choice=None) -> str:
 
 
 def _parse_tool_call_body(body: str) -> dict | None:
-    """Parse the JSON object inside a [tool_call] block into an OpenAI call."""
+    """Parse the JSON object inside a tool-call block into an OpenAI call.
+
+    Accepts both ``<tool_call>`` (preferred) and legacy ``[tool_call]``
+    bodies — both normalize to the same representation. Exactly one JSON
+    object per block; no markdown fences; no wrapper text inside. Malformed
+    JSON returns None (caller keeps the block verbatim as visible content,
+    never exposes it as a tool call).
+    """
     try:
         obj = json.loads(body)
     except json.JSONDecodeError:
@@ -577,6 +766,18 @@ def _parse_tool_call_body(body: str) -> dict | None:
         return None
     args = obj.get("arguments", obj.get("parameters", obj.get("args", {})))
     if isinstance(args, str):
+        # arguments as string must itself be valid JSON object text when
+        # non-empty; malformed strings are rejected (not a tool call).
+        s = args.strip()
+        if s and not (s.startswith("{") or s.startswith('"')):
+            # Plain non-JSON strings are not valid tool arguments per the
+            # "exactly one JSON object" contract — but be lenient: if it
+            # fails to parse as JSON, keep raw string only when it looks
+            # like JSON; otherwise reject to avoid malformed calls.
+            try:
+                json.loads(s)
+            except json.JSONDecodeError:
+                return None
         arg_str = args
     else:
         try:
@@ -584,6 +785,13 @@ def _parse_tool_call_body(body: str) -> dict | None:
                                  ensure_ascii=False)
         except (TypeError, ValueError):
             arg_str = "{}"
+    # arguments must be a JSON object when parsed (not a list/scalar).
+    try:
+        parsed_args = json.loads(arg_str) if isinstance(arg_str, str) else args
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(parsed_args, dict):
+        return None
     return {
         "id": f"call_{uuid.uuid4().hex[:24]}",
         "type": "function",
@@ -591,35 +799,65 @@ def _parse_tool_call_body(body: str) -> dict | None:
     }
 
 
-def extract_tool_calls(text: str) -> tuple[str, list[dict]]:
-    """Strip complete [tool_call] blocks (parsed) from ``text``.
+def _find_next_open(text: str, start: int) -> tuple[int, str, str] | None:
+    """Earliest tool-call open at/after ``start``: (idx, open, close)."""
+    best: tuple[int, str, str] | None = None
+    for o, c in _TOOL_MARKERS:
+        j = text.find(o, start)
+        if j < 0:
+            continue
+        if best is None or j < best[0]:
+            best = (j, o, c)
+    return best
 
-    Unclosed markers are flushed into content as-is (final malformed output
-    stays visible). Malformed but complete markers are kept verbatim.
+
+def _partial_open_hold(rest: str) -> int:
+    """Longest suffix of ``rest`` that could become a tool open prefix."""
+    hold = 0
+    for o, _ in _TOOL_MARKERS:
+        max_h = min(len(o) - 1, len(rest))
+        for k in range(max_h, 0, -1):
+            if o.startswith(rest[len(rest) - k:]):
+                hold = max(hold, k)
+                break
+    return hold
+
+
+def extract_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """Strip complete tool-call blocks (parsed) from ``text``.
+
+    Accepts both ``<tool_call>...</tool_call>`` (preferred) and legacy
+    ``[tool_call]...[/tool_call]``; both normalize identically. Unclosed
+    markers are flushed into content as-is (final malformed output stays
+    visible). Malformed but complete markers are kept verbatim (never a
+    tool call).
     """
-    if not text or TOOL_OPEN not in text:
-        return text or "", []
+    if not text:
+        return "", []
+    if TOOL_OPEN_XML not in text and TOOL_OPEN_BRACKET not in text:
+        return text, []
     calls: list[dict] = []
     parts: list[str] = []
     i = 0
     n = len(text)
     while i < n:
-        j = text.find(TOOL_OPEN, i)
-        if j < 0:
+        nxt = _find_next_open(text, i)
+        if nxt is None:
             parts.append(text[i:])
             break
+        j, o, c = nxt
         parts.append(text[i:j])
-        k = text.find(TOOL_CLOSE, j + len(TOOL_OPEN))
+        k = text.find(c, j + len(o))
         if k < 0:
             parts.append(text[j:])  # unclosed: keep visible
             break
-        body = text[j + len(TOOL_OPEN):k]
+        body = text[j + len(o):k]
         call = _parse_tool_call_body(body)
         if call is not None:
             calls.append(call)
         else:
-            parts.append(text[j:k + len(TOOL_CLOSE)])
-        i = k + len(TOOL_CLOSE)
+            parts.append(text[j:k + len(c)])
+        i = k + len(c)
     return "".join(parts), calls
 
 
@@ -627,9 +865,10 @@ def streaming_view(text: str) -> tuple[str, list[dict]]:
     """Content safe to emit now + complete calls so far.
 
     Unlike :func:`extract_tool_calls`, an unclosed marker (or a partial
-    ``[tool_call]`` prefix at the end of the buffer) is *held back* — those
-    bytes may still turn into a complete block and must never leak into the
-    client's content stream.
+    ``<tool_call>`` / ``[tool_call]`` prefix at the end of the buffer) is
+    *held back* — those bytes may still turn into a complete block and must
+    never leak into the client's content stream as ordinary assistant
+    content while still being generated.
     """
     if not text:
         return "", []
@@ -638,40 +877,38 @@ def streaming_view(text: str) -> tuple[str, list[dict]]:
     i = 0
     n = len(text)
     while i < n:
-        j = text.find(TOOL_OPEN, i)
-        if j < 0:
+        nxt = _find_next_open(text, i)
+        if nxt is None:
             rest = text[i:]
-            max_h = min(len(TOOL_OPEN) - 1, len(rest))
-            hold = 0
-            for k in range(max_h, 0, -1):
-                if TOOL_OPEN.startswith(rest[len(rest) - k:]):
-                    hold = k
-                    break
+            hold = _partial_open_hold(rest)
             parts.append(rest[: len(rest) - hold] if hold else rest)
             break
+        j, o, c = nxt
         parts.append(text[i:j])
-        k = text.find(TOOL_CLOSE, j + len(TOOL_OPEN))
+        k = text.find(c, j + len(o))
         if k < 0:
             break  # hold from OPEN through end
-        body = text[j + len(TOOL_OPEN):k]
+        body = text[j + len(o):k]
         call = _parse_tool_call_body(body)
         if call is not None:
             calls.append(call)
         else:
-            parts.append(text[j:k + len(TOOL_CLOSE)])
-        i = k + len(TOOL_CLOSE)
+            parts.append(text[j:k + len(c)])
+        i = k + len(c)
     return "".join(parts), calls
 
 
 class ToolCallStreamParser:
     """Feed raw deltas; emit only client-safe content; collect finished calls.
 
-    Complete ``[tool_call]`` blocks become available *as they complete*
-    via :meth:`drain_calls` (so the wire stream can carry a valid
-    ``delta.tool_calls`` before the final finish chunk) while incomplete
-    markers stay held — half-valid JSON arguments are never exposed.
-    :meth:`finish` still returns every call that was not drained yet, so
-    callers that only collect at completion keep the old behavior.
+    Complete ``<tool_call>`` (preferred) or legacy ``[tool_call]`` blocks
+    become available *as they complete* via :meth:`drain_calls` (so the
+    wire stream can carry a valid ``delta.tool_calls`` before the final
+    finish chunk) while incomplete markers stay held — half-valid JSON
+    arguments are never exposed and incomplete blocks never leak as
+    ordinary content. :meth:`finish` still returns every call that was not
+    drained yet, so callers that only collect at completion keep the old
+    behavior.
     """
 
     def __init__(self) -> None:
@@ -851,8 +1088,10 @@ class StreamTranslator:
     Wire contract (Hermes' Chat Completions view):
 
         role chunk -> reasoning_content deltas -> content deltas
-                    -> [delta.tool_calls per complete [tool_call] block]
+                    -> [delta.tool_calls per complete <tool_call> block]
                     -> finish_reason -> [DONE]
+
+    (Legacy ``[tool_call]`` blocks follow the same contract.)
 
     Design notes:
 
@@ -864,8 +1103,10 @@ class StreamTranslator:
         correct field once the metadata lands (opencode#26924);
       * snapshot ``text`` accumulated on ``message.part.updated`` is
         merged without re-emitting bytes already streamed;
-      * tool blocks are only converted once complete — malformed or
-        partial blocks stay hidden from the content stream.
+      * tool blocks (``<tool_call>`` preferred, ``[tool_call]`` legacy)
+        are only converted once complete — malformed, partial, or
+        unclosed blocks stay held (never leak as content) until the
+        matching close tag arrives.
     """
 
     def __init__(self, completion_id: str, model: str, bridge: bool) -> None:
@@ -882,6 +1123,8 @@ class StreamTranslator:
         self.reasoning_emitted = ""
         self.content_emitted = ""
         self.call_index = 0  # OpenAI tool_calls[].index + count of calls
+        # retained for debug logging (ids/names only, never full secrets)
+        self.emitted_calls: list[dict] = []
 
     # ---- chunk builders --------------------------------------------------
     def role_chunk(self) -> str:
@@ -908,6 +1151,7 @@ class StreamTranslator:
             "function": call.get("function") or {},
         }
         self.call_index += 1
+        self.emitted_calls.append(payload)
         return chunk(self.cid, self.model, delta={"tool_calls": [payload]})
 
     # ---- field-level emission -------------------------------------------
@@ -1709,6 +1953,10 @@ def make_app(cli: str, work_dir: str, *,
                     for c in calls))
             if raw_reasoning:
                 log(f"reasoning: {len(raw_reasoning)} chars (blocking)")
+            _debug_tool_turn(model=model, transport="serve", mode=mode,
+                             tools_list=tools_list, tool_choice=tool_choice,
+                             raw=raw, calls=calls,
+                             reasoning=raw_reasoning, incoming_msgs=msgs)
             return (text, raw_reasoning, info.get("tokens") or {}, sid, mode,
                     calls)
 
@@ -1731,6 +1979,10 @@ def make_app(cli: str, work_dir: str, *,
                 for c in calls))
         if raw_reasoning:
             log(f"reasoning: {len(raw_reasoning)} chars (blocking, run)")
+        _debug_tool_turn(model=model, transport="run", mode=mode,
+                         tools_list=tools_list, tool_choice=tool_choice,
+                         raw=raw, calls=calls,
+                         reasoning=raw_reasoning, incoming_msgs=msgs)
         return text, raw_reasoning, {}, new_sid or sid or "", mode, calls
 
     async def handle_chat(request: web.Request) -> web.StreamResponse:
@@ -1838,13 +2090,24 @@ def make_app(cli: str, work_dir: str, *,
                     msg = (err.get("data") or {}).get("message") or \
                         err.get("name") or "backend error"
                     raise RuntimeError(msg)
-                payloads, text, reasoning = tr.finalize_parts(
-                    envelope.get("parts", []))
+                raw_parts = envelope.get("parts", [])
+                payloads, text, reasoning = tr.finalize_parts(raw_parts)
                 for payload in payloads:
                     await send(payload)
                 registry.record(rec["digests"], kind, sid, text,
                                 tools_sig=tools_sig)
                 tokens = info.get("tokens") or {}
+                if DEBUG:
+                    _raw_dbg, _reas_dbg = split_envelope_parts(raw_parts)
+                    _debug_tool_turn(
+                        model=model, transport="serve", mode=mode,
+                        tools_list=tools_list, tool_choice=tool_choice,
+                        raw=_raw_dbg, calls=[
+                            {"id": c.get("id"),
+                             "function": c.get("function") or {}}
+                            for c in tr.emitted_calls],
+                        reasoning=tr.reasoning_emitted or _reas_dbg,
+                        incoming_msgs=msgs)
             else:
                 async def on_delta(delta: str, field: str = "text") -> None:
                     if field == "reasoning":
@@ -1867,6 +2130,15 @@ def make_app(cli: str, work_dir: str, *,
                 registry.record(rec["digests"], kind, new_sid or "", text,
                                 tools_sig=tools_sig)
                 tokens = {}
+                _debug_tool_turn(
+                    model=model, transport="run", mode=mode,
+                    tools_list=tools_list, tool_choice=tool_choice,
+                    raw=raw, calls=[
+                        {"id": c.get("id"),
+                         "function": c.get("function") or {}}
+                        for c in tr.emitted_calls],
+                    reasoning=tr.reasoning_emitted,
+                    incoming_msgs=msgs)
 
             finish = "tool_calls" if tr.call_index else "stop"
             if tr.call_index:
@@ -2007,7 +2279,14 @@ def main() -> None:
                     help="opencode agent for prompts; '' = built-in default")
     ap.add_argument("--default-model", default="big-pickle",
                     help="model used when the request names none")
+    ap.add_argument("--debug", action="store_true",
+                    default=os.environ.get("OPENCODE_PROXY_DEBUG", "")
+                    .lower() in ("1", "true", "yes", "on"),
+                    help="verbose per-turn tool-call diagnostics (no secrets)")
     args = ap.parse_args()
+    global DEBUG
+    if args.debug:
+        DEBUG = True
 
     try:
         cli = find_cli(args.cli)
