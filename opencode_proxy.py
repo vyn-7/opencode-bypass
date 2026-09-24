@@ -38,6 +38,30 @@ Agentic tool calling (Hermes / any OpenAI client):
   ``[client tools]`` prompt section, the agent instructs the model to emit
   ``[tool_call]\\n{json}\\n[/tool_call]`` blocks, and the proxy converts
   those blocks into standard OpenAI ``tool_calls`` (blocking + streaming).
+  A request-level hash of the effective tools + tool_choice rides along the
+  digest entry, so a changed client-tool contract forces a resync instead of
+  silently reusing a session staged for the old tools.
+
+Reasoning (OpenCode ``reasoning`` parts <-> OpenAI ``reasoning_content``):
+
+  OpenCode streams reasoning as a part with ``type == "reasoning"`` whose
+  deltas arrive as ``message.part.delta`` / ``field == "text"``. The proxy
+  translates them to ``delta.reasoning_content`` — never into
+  ``delta.content``, never into persistent memory — and returns
+  ``message.reasoning_content`` on blocking responses. Per-part state
+  survives the documented OpenCode race where ``message.part.delta`` can
+  arrive *before* ``message.part.updated`` (opencode#26924), dedups
+  snapshot/delta overlap, and reasoning never terminates a stream: the
+  finish reason still follows the final content or tool_calls turn.
+
+Error semantics (never fabricate an answer):
+
+  * pre-stream failures -> HTTP 502 JSON ``{"error": ...}`` (Hermes sees a
+    real error and can retry/fallback);
+  * mid-stream failures -> one structured
+    ``data: {"error": {"message", "type": "server_error"}}`` event then
+    ``[DONE]`` — no assistant content, no ``finish_reason``, no
+    ``[proxy error]`` text (a fake stop would look like success).
 
 Free-tier constraints discovered empirically (do not "optimize" into these):
   * prompt body ``tools`` map            -> 403 FreeTierError
@@ -244,6 +268,9 @@ def _render_tool_calls(tool_calls) -> str:
 
     Without this, an agentic turn looks like ``user -> (empty assistant) ->
     tool result`` and the model loses which action produced the result.
+    The generated call id is preserved verbatim (when present) so it
+    matches the ``[tool result: ...] (call call_...)`` label of the next
+    turn — ids are protocol state, never regenerated on replay.
     """
     rendered = []
     for tc in tool_calls or []:
@@ -257,7 +284,11 @@ def _render_tool_calls(tool_calls) -> str:
                 args = json.dumps(args, ensure_ascii=False)
             except (TypeError, ValueError):
                 args = str(args)
-        rendered.append(f"- {name}({args})")
+        line = f"- {name}({args})"
+        tcid = tc.get("id")
+        if tcid:
+            line += f" (call {tcid})"
+        rendered.append(line)
     if not rendered:
         return ""
     return "[assistant tool calls]\n" + "\n".join(rendered)
@@ -377,12 +408,17 @@ class Registry:
         return best
 
     def record(self, digests: list[str], backend_kind: str, sid: str,
-               last_reply: str) -> dict:
+               last_reply: str, tools_sig: str = "") -> dict:
         entry = {
             "digests": list(digests),
             "backend": backend_kind,
             "sid": sid,
             "last_reply": last_reply,
+            # Request-level metadata (NOT part of the message digest): the
+            # hash of this request's effective tools + tool_choice. A change
+            # here must invalidate the session cursor even when the message
+            # prefix still matches.
+            "tools_sig": tools_sig,
             "used": time.time(),
         }
         self._entries = [e for e in self._entries
@@ -421,6 +457,38 @@ def plan_prompt(msgs, entry: dict | None) -> tuple[str, str, dict]:
         # regenerate from the last message rather than emitting nothing.
         tail = list(msgs[-1:])
     return flatten_tail(tail), "delta", {"digests": digs}
+
+
+def tools_signature(tools_list, tool_choice) -> str:
+    """Canonical hash of the *effective* client-tool contract for one request.
+
+    The message digest registry only sees ``messages`` — if the same
+    conversation changes its available tools or ``tool_choice`` between
+    turns, a prefix match alone would wrongly reuse a backend session that
+    was staged under the old contract. This signature is stored next to the
+    registry entry (request metadata, never mixed into the transcript
+    digest) and a mismatch forces a full resync so the new
+    ``[client tools]`` block is explicitly supplied.
+    """
+    blob = json.dumps(
+        {"tools": tools_list or [], "tool_choice": tool_choice},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def lookup_entry(registry: "Registry", digests: list[str], backend_kind: str,
+                 tools_sig: str) -> dict | None:
+    """Registry cursor that still matches this request's tool contract."""
+    entry = registry.match(digests, backend_kind)
+    if entry is None:
+        return None
+    if entry.get("tools_sig", "") != tools_sig:
+        # Tools/tool_choice changed mid-conversation -> force resync; the
+        # stale entry stays (it becomes valid again if the contract returns).
+        return None
+    return entry
 
 
 # --------------------------------------------------------------------------
@@ -596,25 +664,52 @@ def streaming_view(text: str) -> tuple[str, list[dict]]:
 
 
 class ToolCallStreamParser:
-    """Feed raw deltas; emit only client-safe content; collect finished calls."""
+    """Feed raw deltas; emit only client-safe content; collect finished calls.
+
+    Complete ``[tool_call]`` blocks become available *as they complete*
+    via :meth:`drain_calls` (so the wire stream can carry a valid
+    ``delta.tool_calls`` before the final finish chunk) while incomplete
+    markers stay held — half-valid JSON arguments are never exposed.
+    :meth:`finish` still returns every call that was not drained yet, so
+    callers that only collect at completion keep the old behavior.
+    """
 
     def __init__(self) -> None:
         self.raw = ""
-        self.emitted = 0  # length of clean content already sent
+        self.emitted = 0          # length of clean content already sent
+        self._pending: list[dict] = []  # completed calls not yet drained
+        self._recognized = 0      # complete blocks recognized so far
+        self.emitted_calls = 0    # blocks already handed out (drain/finish)
 
     def feed(self, delta: str) -> str:
         if not delta:
             return ""
         self.raw += delta
-        clean, _ = streaming_view(self.raw)
+        clean, calls = streaming_view(self.raw)
+        # Re-parse mints a fresh id per block on every feed — only surface
+        # blocks beyond the count already recognized (each block once).
+        if len(calls) > self._recognized:
+            self._pending.extend(calls[self._recognized:])
+            self._recognized = len(calls)
         if len(clean) <= self.emitted:
             return ""
         out = clean[self.emitted:]
         self.emitted = len(clean)
         return out
 
+    def drain_calls(self) -> list[dict]:
+        """Pop completed tool calls that have not been handed out yet."""
+        out, self._pending = self._pending, []
+        self.emitted_calls += len(out)
+        return out
+
     def finish(self, final_text: str | None = None) -> tuple[str, list[dict]]:
-        """Flush held content (if final) and return authoritative calls."""
+        """Flush held content (if final) and return calls not yet handed out.
+
+        ``final_text`` is authoritative (blocking envelope): it replaces the
+        streamed raw buffer, so any divergence is corrected here — but blocks
+        already drained during the stream are never returned twice.
+        """
         if final_text is not None:
             self.raw = final_text
         clean, calls = extract_tool_calls(self.raw)
@@ -622,7 +717,11 @@ class ToolCallStreamParser:
         if len(clean) > self.emitted:
             out = clean[self.emitted:]
             self.emitted = len(clean)
-        return out, calls
+        rest = calls[self.emitted_calls:]
+        self._recognized = len(calls)
+        self._pending = []
+        self.emitted_calls = len(calls)
+        return out, rest
 
 
 # --------------------------------------------------------------------------
@@ -659,6 +758,13 @@ def chunk_argv(text: str, limit: int = MAX_ARG_CHARS) -> list[str]:
 
 
 def chunk(completion_id, model, delta=None, finish=None, tool_calls=None):
+    """Build one OpenAI ``chat.completion.chunk`` JSON string.
+
+    ``delta`` is an arbitrary delta dictionary, so a single helper produces
+    ``{"content": ...}``, ``{"reasoning_content": ...}``,
+    ``{"tool_calls": [...]}`` or the initial role chunk without forcing
+    every event into content.
+    """
     d: dict = {}
     if delta is not None:
         d["delta"] = delta if isinstance(delta, dict) else {"content": delta}
@@ -671,6 +777,402 @@ def chunk(completion_id, model, delta=None, finish=None, tool_calls=None):
         "created": 0, "model": model,
         "choices": [{"index": 0, **d}],
     })
+
+
+# --------------------------------------------------------------------------
+# OpenCode event -> OpenAI SSE translation (reasoning kept separate)
+# --------------------------------------------------------------------------
+
+def _payload_text(part: dict, field: str) -> str:
+    """Best-effort string view of ``part[field]`` (str or content blocks)."""
+    val = part.get(field) if isinstance(part, dict) else None
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        chunks = []
+        for blk in val:
+            if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                chunks.append(blk["text"])
+        return "".join(chunks)
+    return ""
+
+
+def _part_snapshot(part: dict) -> str:
+    """Accumulated text of a part snapshot (``text``, else ``content``)."""
+    text = _payload_text(part, "text")
+    if text:
+        return text
+    return _payload_text(part, "content")
+
+
+def split_envelope_parts(parts) -> tuple[str, str]:
+    """Split a blocking OpenCode message envelope into (text, reasoning).
+
+    Reasoning parts are preserved even though the ordinary final response
+    lives in a separate ``text`` part — they must never be silently
+    discarded, mixed into content, or persisted as memory.
+    """
+    texts: list[str] = []
+    reasons: list[str] = []
+    for p in parts or []:
+        if not isinstance(p, dict):
+            continue
+        val = _payload_text(p, "text") or _payload_text(p, "content")
+        if not val:
+            continue
+        ptype = p.get("type")
+        if ptype == "text":
+            texts.append(val)
+        elif ptype == "reasoning":
+            reasons.append(val)
+    return "".join(texts), "".join(reasons)
+
+
+class _PartState:
+    """Per-part streaming state for one request (never persisted)."""
+
+    __slots__ = ("ptype", "emitted", "buffered", "snap_covered",
+                 "snap_consumed")
+
+    def __init__(self) -> None:
+        self.ptype: str | None = None
+        self.emitted: str = ""        # exact text already sent downstream
+        self.buffered: list[str] = [] # deltas held while the type is unknown
+        # Snapshot text that went beyond `emitted` at apply time, and how
+        # much of it has re-arrived as late (duplicate) deltas — guards the
+        # reverse of opencode#26924 without eating genuinely new content.
+        self.snap_covered: str = ""
+        self.snap_consumed: int = 0
+
+
+class StreamTranslator:
+    """Translates OpenCode serve ``/event`` payloads into OpenAI SSE chunks.
+
+    Wire contract (Hermes' Chat Completions view):
+
+        role chunk -> reasoning_content deltas -> content deltas
+                    -> [delta.tool_calls per complete [tool_call] block]
+                    -> finish_reason -> [DONE]
+
+    Design notes:
+
+      * reasoning and content are strictly separate channels — reasoning
+        never lands in ``delta.content``, never in the digest/memory
+        layer, and never produces a finish reason by itself;
+      * deltas that arrive before ``message.part.updated`` (or before the
+        owning ``message.updated``) are buffered, then flushed with the
+        correct field once the metadata lands (opencode#26924);
+      * snapshot ``text`` accumulated on ``message.part.updated`` is
+        merged without re-emitting bytes already streamed;
+      * tool blocks are only converted once complete — malformed or
+        partial blocks stay hidden from the content stream.
+    """
+
+    def __init__(self, completion_id: str, model: str, bridge: bool) -> None:
+        self.cid = completion_id
+        self.model = model
+        self.bridge = bridge
+        self.parser = ToolCallStreamParser() if bridge else None
+        self.assistant_ids: set[str] = set()
+        self.known_mids: set[str] = set()
+        self.parts: dict[str, _PartState] = {}
+        # events whose owning message role is not yet known: mid -> FIFO of
+        # ("part", part) / ("delta", pid, field, delta)
+        self.mid_pending: dict[str, list[tuple]] = {}
+        self.reasoning_emitted = ""
+        self.content_emitted = ""
+        self.call_index = 0  # OpenAI tool_calls[].index + count of calls
+
+    # ---- chunk builders --------------------------------------------------
+    def role_chunk(self) -> str:
+        return chunk(self.cid, self.model,
+                     delta={"role": "assistant", "content": ""})
+
+    def finish_chunks(self) -> list[str]:
+        finish = "tool_calls" if self.call_index else "stop"
+        return [chunk(self.cid, self.model, finish=finish), "[DONE]"]
+
+    @staticmethod
+    def error_payload(message: str) -> str:
+        """Structured mid-stream error Hermes can identify (never content)."""
+        return json.dumps({"error": {
+            "message": message or "proxy error",
+            "type": "server_error",
+        }})
+
+    def _tool_call_chunk(self, call: dict) -> str:
+        payload = {
+            "index": self.call_index,
+            "id": call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": call.get("function") or {},
+        }
+        self.call_index += 1
+        return chunk(self.cid, self.model, delta={"tool_calls": [payload]})
+
+    # ---- field-level emission -------------------------------------------
+    def feed_reasoning(self, piece: str) -> str | None:
+        if not piece:
+            return None
+        self.reasoning_emitted += piece
+        return chunk(self.cid, self.model,
+                     delta={"reasoning_content": piece})
+
+    def feed_content(self, piece: str) -> list[str]:
+        if not piece:
+            return []
+        out: list[str] = []
+        if self.parser is None:
+            self.content_emitted += piece
+            out.append(chunk(self.cid, self.model, delta={"content": piece}))
+            return out
+        visible = self.parser.feed(piece)
+        if visible:
+            self.content_emitted += visible
+            out.append(chunk(self.cid, self.model, delta={"content": visible}))
+        for call in self.parser.drain_calls():
+            out.append(self._tool_call_chunk(call))
+        return out
+
+    def _route(self, ptype: str | None, piece: str) -> list[str]:
+        if not piece:
+            return []
+        if ptype == "reasoning":
+            out = self.feed_reasoning(piece)
+            return [out] if out else []
+        if ptype == "text":
+            return self.feed_content(piece)
+        return []  # tool/step/... parts never surface as chat content
+
+    # ---- per-part bookkeeping -------------------------------------------
+    def _part(self, pid: str) -> _PartState:
+        st = self.parts.get(pid)
+        if st is None:
+            st = self.parts[pid] = _PartState()
+        return st
+
+    def _delta_guarded(self, st: _PartState, piece: str) -> bool:
+        """True when ``piece`` duplicates snapshot text already streamed."""
+        cov = st.snap_covered
+        i = st.snap_consumed
+        if cov and cov[i:].startswith(piece):
+            st.snap_consumed = i + len(piece)
+            return True
+        return False
+
+    def _apply_snapshot(self, st: _PartState, snap: str,
+                        initial: bool) -> list[str]:
+        """Merge an authoritative part snapshot without duplicate bytes."""
+        if initial:
+            queued = "".join(st.buffered)
+            st.buffered = []
+            if snap.startswith(queued):
+                # snapshot covers the buffered deltas (and may extend past
+                # them): stream it whole; buffered bytes are inside it.
+                if snap:
+                    out = self._route(st.ptype, snap)
+                    st.emitted = snap
+                    st.snap_covered = snap
+                    st.snap_consumed = len(queued)
+                    return out
+                return []
+            if queued.startswith(snap):
+                # snapshot is behind (e.g. creation with text=""): the
+                # buffered deltas are newer — stream them as the head.
+                out = self._route(st.ptype, queued) if queued else []
+                st.emitted = queued
+                st.snap_covered = ""
+                st.snap_consumed = 0
+                return out
+            # divergence: prefer the streamed delta order over the snapshot
+            head = queued or snap
+            out = self._route(st.ptype, head) if head else []
+            st.emitted = head
+            st.snap_covered = head if (snap and not queued) else ""
+            st.snap_consumed = 0
+            return out
+
+        emitted = st.emitted
+        if not snap:
+            return []
+        if snap.startswith(emitted):
+            tail = snap[len(emitted):]
+            st.emitted = snap
+            st.snap_covered = tail
+            st.snap_consumed = 0
+            return self._route(st.ptype, tail)
+        if emitted.startswith(snap):
+            return []  # snapshot behind the stream (e.g. final trimEnd)
+        return []      # divergent snapshot: ignore rather than corrupt
+
+    # ---- event handlers --------------------------------------------------
+    @staticmethod
+    def _event_session(props: dict):
+        """Session id of an event (top-level, or nested in info/part)."""
+        sid = props.get("sessionID")
+        if sid:
+            return sid
+        info = props.get("info")
+        if isinstance(info, dict) and info.get("sessionID"):
+            return info["sessionID"]
+        part = props.get("part")
+        if isinstance(part, dict) and part.get("sessionID"):
+            return part["sessionID"]
+        return None
+
+    def _mid_known_user(self, mid) -> bool:
+        return (mid is not None and mid in self.known_mids
+                and mid not in self.assistant_ids)
+
+    def _register_part(self, part: dict) -> list[str]:
+        pid = part.get("id")
+        if not pid:
+            return []
+        mid = part.get("messageID")
+        if self._mid_known_user(mid):
+            return []
+        if mid is not None and mid not in self.assistant_ids:
+            # owning message role not known yet -> hold the registration
+            self.mid_pending.setdefault(mid, []).append(("part", part))
+            return []
+        return self._register_part_now(part)
+
+    def _register_part_now(self, part: dict) -> list[str]:
+        pid = part["id"]
+        st = self._part(pid)
+        ptype = part.get("type")
+        snap = _part_snapshot(part)
+        out: list[str] = []
+        if ptype:
+            first = st.ptype is None
+            st.ptype = ptype
+            if first:
+                if ptype in ("text", "reasoning"):
+                    out += self._apply_snapshot(st, snap, initial=True)
+                else:
+                    st.buffered = []  # non-content part: drop stray deltas
+                return out
+        # subsequent snapshot for a known type (final/intermediate update)
+        if snap:
+            out += self._apply_snapshot(st, snap, initial=False)
+        return out
+
+    def _handle_delta(self, pid: str | None, mid, field: str,
+                      delta: str) -> list[str]:
+        if not delta or not pid:
+            return []
+        if self._mid_known_user(mid):
+            return []
+        if mid is not None and mid not in self.assistant_ids:
+            self.mid_pending.setdefault(mid, []).append(
+                ("delta", pid, field, delta))
+            return []
+        st = self._part(pid)
+        if st.ptype is None:
+            st.buffered.append(delta)  # type unknown -> buffer, never drop
+            return []
+        if self._delta_guarded(st, delta):
+            return []
+        out = self._route(st.ptype, delta)
+        st.emitted += delta
+        return out
+
+    def handle_session(self, evt, sid: str) -> list[str]:
+        """Translate one serve event, filtered to the active session."""
+        if not isinstance(evt, dict):
+            return []
+        props = evt.get("properties") or {}
+        evt_sid = self._event_session(props)
+        if evt_sid != sid:
+            return []  # foreign or unattributable event (original behavior)
+        etype = evt.get("type")
+        if etype == "message.updated":
+            return self._on_message_updated(props)
+        if etype == "message.part.updated":
+            part = props.get("part")
+            return self._register_part(part) if isinstance(part, dict) else []
+        if etype == "message.part.delta":
+            return self._handle_delta(
+                props.get("partID"), props.get("messageID"),
+                props.get("field") or "text", props.get("delta") or "")
+        return []
+
+    def _on_message_updated(self, props) -> list[str]:
+        info = props.get("info") or {}
+        mid = info.get("id")
+        if not mid:
+            return []
+        self.known_mids.add(mid)
+        pending = self.mid_pending.pop(mid, [])
+        if info.get("role") != "assistant":
+            return []  # known non-assistant (user echo): discard held events
+        self.assistant_ids.add(mid)
+        out: list[str] = []
+        for ev in pending:
+            if ev[0] == "part":
+                out += self._register_part_now(ev[1])
+            elif ev[0] == "delta":
+                _, pid, field, delta = ev
+                out += self._handle_delta(pid, mid, field, delta)
+        return out
+
+    # ---- completion ------------------------------------------------------
+    @staticmethod
+    def _tail(final: str, emitted: str) -> str:
+        """Unemitted suffix of an authoritative final string.
+
+        Normal case: final extends what we streamed (or trims it, e.g.
+        ``trimEnd`` on the final snapshot) -> exact suffix. Divergent
+        snapshots fall back to the historical length-based tail so content
+        is never silently lost.
+        """
+        if not final:
+            return ""
+        if final.startswith(emitted):
+            return final[len(emitted):]
+        if emitted.startswith(final):
+            return ""
+        return final[len(emitted):] if len(final) > len(emitted) else ""
+
+    def finalize_text(self, final_text: str,
+                      final_reasoning: str) -> tuple[list[str], str, str]:
+        """End the stream against the authoritative backend result.
+
+        Returns ``(payloads, text, reasoning)`` where payloads contain any
+        missing reasoning/content tail, the remaining tool-call deltas,
+        the finish chunk and ``[DONE]`` — in that order. Reasoning is
+        reconciled on its own channel and can never become content. A
+        reasoning part alone never finishes the stream: the finish reason
+        still reflects content/tool_calls semantics (requirement: reasoning
+        is not the final assistant message).
+        """
+        out: list[str] = []
+        r_tail = self._tail(final_reasoning or "", self.reasoning_emitted)
+        if r_tail:
+            piece = self.feed_reasoning(r_tail)
+            if piece:
+                out.append(piece)
+        calls: list[dict] = []
+        if self.parser is not None:
+            rest, calls = self.parser.finish(final_text)
+            if rest:
+                self.content_emitted += rest
+                out.append(chunk(self.cid, self.model,
+                                 delta={"content": rest}))
+        else:
+            c_tail = self._tail(final_text or "", self.content_emitted)
+            if c_tail:
+                self.content_emitted += c_tail
+                out.append(chunk(self.cid, self.model,
+                                 delta={"content": c_tail}))
+        for call in calls:
+            out.append(self._tool_call_chunk(call))
+        out += self.finish_chunks()
+        return out, self.content_emitted, self.reasoning_emitted
+
+    def finalize_parts(self, parts) -> tuple[list[str], str, str]:
+        text, reasoning = split_envelope_parts(parts)
+        return self.finalize_text(text, reasoning)
 
 
 # --------------------------------------------------------------------------
@@ -966,10 +1468,24 @@ class RunBackend:
         self.work_dir = work_dir
 
     async def run(self, model: str, prompt: str, session_id: str | None,
-                  on_delta=None) -> tuple[str, str | None]:
-        """One `run` invocation. Returns (text, discovered_session_id).
+                  on_delta=None) -> tuple[str, str, str | None]:
+        """One `run` invocation. Returns (text, reasoning, session_id).
 
-        ``on_delta`` (optional async) receives incremental text as it arrives.
+        ``on_delta`` (optional async) receives (delta, field) where field
+        is ``"text"`` or ``"reasoning"``.
+
+        Output format empirically inspected on opencode 1.18.32
+        (``run --format json``):
+
+          * each part arrives as ONE complete JSON event at part
+            completion (``{"type": "text"|"reasoning", "part": {...}}``) —
+            the CLI ignores ``message.part.delta`` (opencode#38638), so
+            there is no token-level streaming to translate on this path;
+          * ``reasoning`` events are only emitted with ``--thinking``
+            (run.ts: ``part.type === "reasoning" && part.time?.end &&
+            thinking``) — the proxy therefore always passes the flag;
+          * limits: reasoning/text arrive complete-per-part (block-style,
+            not delta-style) and errors arrive as ``{"type":"error"}``.
         """
         args = chunk_argv(prompt)
         hard_split = any(" " not in a and len(a) >= MAX_ARG_CHARS for a in args)
@@ -979,6 +1495,7 @@ class RunBackend:
         cmd_args = [
             "run",
             "--format", "json",
+            "--thinking",   # without it the CLI drops reasoning parts
             "--model", normalize_model(model),
             "--dir", self.work_dir,
         ]
@@ -996,11 +1513,27 @@ class RunBackend:
             cwd=self.work_dir,
         )
         parts: list[str] = []
-        sent = ""
+        reasoning_parts: list[str] = []
+        # complete-per-part events, keyed by part id (multiple parts possible)
+        seen: dict[str, int] = {}
         found_sid = session_id
+        err_events: list[str] = []
+
+        def _event_text(obj: dict, ptype: str) -> str:
+            part = obj.get("part")
+            if isinstance(part, dict):
+                val = part.get("text")
+                if isinstance(val, str) and val:
+                    return val
+                if isinstance(val, list):
+                    return "".join(
+                        b.get("text", "") for b in val
+                        if isinstance(b, dict) and isinstance(b.get("text"), str))
+            val = obj.get("text")
+            return val if isinstance(val, str) else ""
 
         async def pump():
-            nonlocal sent, found_sid
+            nonlocal found_sid
             assert proc.stdout is not None
             while True:
                 line = await asyncio.wait_for(
@@ -1016,17 +1549,37 @@ class RunBackend:
                     continue
                 if not found_sid and obj.get("sessionID"):
                     found_sid = obj["sessionID"]
-                if obj.get("type") == "text":
-                    part = obj.get("part", {})
-                    new = part if isinstance(part, str) else \
-                        (part.get("text", obj.get("text", "")) if isinstance(part, dict)
-                         else obj.get("text", ""))
-                    if new and len(new) > len(sent):
-                        delta = new[len(sent):]
-                        parts.append(delta)
-                        sent = new
-                        if on_delta is not None:
-                            await on_delta(delta)
+                etype = obj.get("type")
+                if etype == "error":
+                    err = obj.get("error")
+                    if isinstance(err, dict):
+                        msg = (err.get("data") or {}).get("message") \
+                            or err.get("name") or "opencode run error"
+                    else:
+                        msg = str(err or "opencode run error")
+                    err_events.append(str(msg))
+                    continue
+                if etype not in ("text", "reasoning"):
+                    continue
+                part = obj.get("part") if isinstance(obj.get("part"), dict) \
+                    else {}
+                pid = part.get("id") or f"{etype}:{len(seen)}"
+                new = _event_text(obj, etype)
+                if not new:
+                    continue
+                already = seen.get(pid, 0)
+                if len(new) <= already:
+                    continue  # same completion event seen again
+                delta = new[already:]
+                seen[pid] = len(new)
+                if etype == "reasoning":
+                    reasoning_parts.append(delta)
+                    if on_delta is not None:
+                        await on_delta(delta, "reasoning")
+                else:
+                    parts.append(delta)
+                    if on_delta is not None:
+                        await on_delta(delta, "text")
 
         try:
             await pump()
@@ -1038,11 +1591,13 @@ class RunBackend:
                     pass
             raise
         rc = await proc.wait()
+        if err_events:
+            raise RuntimeError(err_events[-1])
         if rc != 0:
             assert proc.stderr is not None
             err = (await proc.stderr.read()).decode("utf-8", "replace")[-500:]
             raise RuntimeError(f"opencode exit {rc}: {err}")
-        return "".join(parts), found_sid
+        return "".join(parts), "".join(reasoning_parts), found_sid
 
     async def shutdown(self) -> None:
         pass
@@ -1118,11 +1673,11 @@ def make_app(cli: str, work_dir: str, *,
                 prompt = f"{prompt}\n\n{block}"
         return prompt, mode, rec
 
-    async def complete(msgs, model, tools_list, tool_choice):
-        """One completion. Returns (text, tokens, sid, mode, tool_calls)."""
+    async def complete(msgs, model, tools_list, tool_choice, tools_sig):
+        """One completion. Returns (text, reasoning, tokens, sid, mode, calls)."""
         backend, kind = await get_backend()
         digs = digests_of(msgs)
-        entry = registry.match(digs, kind)
+        entry = lookup_entry(registry, digs, kind, tools_sig)
         prompt, mode, rec = build_prompt(msgs, entry, tools_list, tool_choice)
         bridge = bool(tools_list)
 
@@ -1141,28 +1696,42 @@ def make_app(cli: str, work_dir: str, *,
                 msg = (err.get("data") or {}).get("message") or err.get("name") \
                     or "backend error"
                 raise RuntimeError(msg)
-            raw = "".join(p.get("text", "") for p in envelope.get("parts", [])
-                          if p.get("type") == "text")
+            raw, raw_reasoning = split_envelope_parts(envelope.get("parts", []))
             if bridge:
                 text, calls = extract_tool_calls(raw)
             else:
                 text, calls = raw, []
-            registry.record(rec["digests"], kind, sid, text)
-            return text, info.get("tokens") or {}, sid, mode, calls
+            registry.record(rec["digests"], kind, sid, text,
+                            tools_sig=tools_sig)
+            if calls:
+                log("tool_calls: " + ", ".join(
+                    f"{(c.get('function') or {}).get('name', '?')}={c.get('id', '?')}"
+                    for c in calls))
+            if raw_reasoning:
+                log(f"reasoning: {len(raw_reasoning)} chars (blocking)")
+            return (text, raw_reasoning, info.get("tokens") or {}, sid, mode,
+                    calls)
 
         # run backend
         sid = entry["sid"] if (entry and mode == "delta") else None
         log(f"{mode:6} {len(msgs)} msgs ({len(prompt)} chars) -> run "
             f"{'-s ' + sid[-8:] if sid else '(new session)'}")
-        raw, new_sid = await backend.run(model, prompt, sid)
-        if not raw:
+        raw, raw_reasoning, new_sid = await backend.run(model, prompt, sid)
+        if not raw and not raw_reasoning:
             raise RuntimeError("empty response from opencode run")
         if bridge:
             text, calls = extract_tool_calls(raw)
         else:
             text, calls = raw, []
-        registry.record(rec["digests"], kind, new_sid or sid or "", text)
-        return text, {}, new_sid or sid or "", mode, calls
+        registry.record(rec["digests"], kind, new_sid or sid or "", text,
+                        tools_sig=tools_sig)
+        if calls:
+            log("tool_calls: " + ", ".join(
+                f"{(c.get('function') or {}).get('name', '?')}={c.get('id', '?')}"
+                for c in calls))
+        if raw_reasoning:
+            log(f"reasoning: {len(raw_reasoning)} chars (blocking, run)")
+        return text, raw_reasoning, {}, new_sid or sid or "", mode, calls
 
     async def handle_chat(request: web.Request) -> web.StreamResponse:
         try:
@@ -1182,6 +1751,7 @@ def make_app(cli: str, work_dir: str, *,
                 status=400)
         tools_list = effective_tools(body.get("tools"), body.get("tool_choice"))
         tool_choice = body.get("tool_choice")
+        tools_sig = tools_signature(tools_list, tool_choice)
 
         digs = digests_of(msgs)
         preview = _text_of(msgs[-1].get("content", ""))[:60] \
@@ -1192,16 +1762,33 @@ def make_app(cli: str, work_dir: str, *,
 
         if not stream:
             try:
-                text, tokens, _sid, mode, calls = await complete(
-                    msgs, model, tools_list, tool_choice)
+                text, reasoning, tokens, _sid, mode, calls = await complete(
+                    msgs, model, tools_list, tool_choice, tools_sig)
             except Exception as e:
                 log(f"ERROR: {e}")
                 return web.json_response({"error": {"message": str(e)}},
                                          status=502)
             return web.json_response(
-                _blocking_response(cid, model, text, tokens, calls))
+                _blocking_response(cid, model, text, tokens, calls,
+                                   reasoning_content=reasoning))
 
-        # ---- SSE: blocking completion + live deltas from the event hub ----
+        # ---- SSE setup: everything that can fail *before* the 200 commits.
+        # Transport failures surface as real HTTP errors so Hermes' retry /
+        # fallback logic sees them (a fabricated assistant answer would not).
+        try:
+            backend, kind = await get_backend()
+            entry = lookup_entry(registry, digs, kind, tools_sig)
+            prompt, mode, rec = build_prompt(msgs, entry, tools_list,
+                                             tool_choice)
+            sid = entry["sid"] if (entry and mode == "delta") else None
+            if kind == "serve" and sid is None:
+                sid = await backend.create_session(model)
+        except Exception as e:
+            log(f"ERROR (pre-stream): {e}")
+            return web.json_response({"error": {"message": str(e)}},
+                                     status=502)
+        log(f"{mode:6} {len(msgs)} msgs ({len(prompt)} chars) -> {kind}")
+
         resp = web.StreamResponse(status=200, headers={
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -1216,75 +1803,18 @@ def make_app(cli: str, work_dir: str, *,
         q: asyncio.Queue | None = None
         post: asyncio.Task | None = None
         bridge = bool(tools_list)
-        parser = ToolCallStreamParser() if bridge else None
+        tr = StreamTranslator(cid, model, bridge)
+        finish = "stop"
         try:
-            await send(chunk(cid, model, delta={"role": "assistant", "content": ""}))
-            backend, kind = await get_backend()
-            entry = registry.match(digs, kind)
-            prompt, mode, rec = build_prompt(msgs, entry, tools_list, tool_choice)
-            log(f"{mode:6} {len(msgs)} msgs ({len(prompt)} chars) -> {kind}")
-
+            await send(tr.role_chunk())
             q = state["hub"].subscribe()
-            sent = 0
-
-            async def emit_content(piece: str) -> None:
-                nonlocal sent
-                if not piece:
-                    return
-                sent += len(piece)
-                await send(chunk(cid, model, delta=piece))
 
             if kind == "serve":
-                sid = entry["sid"] if (entry and mode == "delta") else None
-                if sid is None:
-                    sid = await backend.create_session(model)
                 post = asyncio.create_task(backend.prompt(sid, prompt, model))
 
-                part_types: dict[str, str] = {}
-                assistant_ids: set[str] = set()
-                buffered: dict[str, list[str]] = {}
-
                 async def pump_evt(evt) -> None:
-                    if not isinstance(evt, dict):
-                        return
-                    etype = evt.get("type")
-                    props = evt.get("properties") or {}
-                    if props.get("sessionID") != sid:
-                        return
-                    if etype == "message.updated":
-                        info = props.get("info") or {}
-                        if info.get("role") == "assistant" and info.get("id"):
-                            assistant_ids.add(info["id"])
-                        return
-                    if etype == "message.part.updated":
-                        part = props.get("part") or {}
-                        pid = part.get("id")
-                        if pid and part.get("type"):
-                            part_types[pid] = part["type"]
-                            if pid in buffered:
-                                queued = buffered.pop(pid)
-                                if part["type"] == "text":
-                                    for d in queued:
-                                        if parser is not None:
-                                            await emit_content(parser.feed(d))
-                                        else:
-                                            await emit_content(d)
-                        return
-                    if etype == "message.part.delta":
-                        pid = props.get("partID")
-                        mid = props.get("messageID")
-                        delta = props.get("delta") or ""
-                        if not delta or mid not in assistant_ids:
-                            return
-                        ptype = part_types.get(pid)
-                        if ptype == "text":
-                            if parser is not None:
-                                await emit_content(parser.feed(delta))
-                            else:
-                                await emit_content(delta)
-                        elif ptype is None:
-                            # part type not known yet — buffer until updated
-                            buffered.setdefault(pid, []).append(delta)
+                    for payload in tr.handle_session(evt, sid):
+                        await send(payload)
 
                 # pump queue while the blocking prompt runs
                 while not post.done():
@@ -1308,62 +1838,53 @@ def make_app(cli: str, work_dir: str, *,
                     msg = (err.get("data") or {}).get("message") or \
                         err.get("name") or "backend error"
                     raise RuntimeError(msg)
-                final_raw = "".join(
-                    p.get("text", "") for p in envelope.get("parts", [])
-                    if p.get("type") == "text")
-                calls: list[dict] = []
-                if parser is not None:
-                    rest, calls = parser.finish(final_raw)
-                    await emit_content(rest)
-                    text, _ = extract_tool_calls(final_raw)
-                else:
-                    if len(final_raw) > sent:
-                        await emit_content(final_raw[sent:])
-                    text = final_raw
-                registry.record(rec["digests"], kind, sid, text)
+                payloads, text, reasoning = tr.finalize_parts(
+                    envelope.get("parts", []))
+                for payload in payloads:
+                    await send(payload)
+                registry.record(rec["digests"], kind, sid, text,
+                                tools_sig=tools_sig)
                 tokens = info.get("tokens") or {}
             else:
-                async def on_delta(delta: str) -> None:
-                    if parser is not None:
-                        await emit_content(parser.feed(delta))
+                async def on_delta(delta: str, field: str = "text") -> None:
+                    if field == "reasoning":
+                        piece = tr.feed_reasoning(delta)
+                        if piece:
+                            await send(piece)
                     else:
-                        await emit_content(delta)
+                        for payload in tr.feed_content(delta):
+                            await send(payload)
 
-                raw, new_sid = await backend.run(
-                    model, prompt,
-                    entry["sid"] if (entry and mode == "delta") else None,
-                    on_delta=on_delta,
+                raw, raw_reasoning, new_sid = await backend.run(
+                    model, prompt, sid, on_delta=on_delta,
                 )
-                calls = []
-                if parser is not None:
-                    rest, calls = parser.finish(raw)
-                    await emit_content(rest)
-                    text, _ = extract_tool_calls(raw)
-                else:
-                    text = raw
-                    if raw and sent < len(raw):
-                        await emit_content(raw[sent:])
-                registry.record(rec["digests"], kind, new_sid or "", text)
+                if not raw and not raw_reasoning:
+                    raise RuntimeError("empty response from opencode run")
+                payloads, text, reasoning = tr.finalize_text(
+                    raw, raw_reasoning)
+                for payload in payloads:
+                    await send(payload)
+                registry.record(rec["digests"], kind, new_sid or "", text,
+                                tools_sig=tools_sig)
                 tokens = {}
 
-            # tool_calls deltas must arrive before the final finish_reason
-            for i, tc in enumerate(calls or []):
-                await send(chunk(cid, model, tool_calls=[{
-                    "index": i,
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": tc["function"],
-                }]))
-            finish = "tool_calls" if calls else "stop"
-            await send(chunk(cid, model, finish=finish))
-            await send("[DONE]")
+            finish = "tool_calls" if tr.call_index else "stop"
+            if tr.call_index:
+                log(f"tool_calls: {tr.call_index} (finish=tool_calls)")
+            if tr.reasoning_emitted:
+                log(f"reasoning: {len(tr.reasoning_emitted)} chars")
             await resp.write_eof()
-            log(f"-> done (stream, {sent} chars, {len(calls or [])} tool_calls)")
+            log(f"-> done (stream, content={len(tr.content_emitted)}, "
+                f"reasoning={len(tr.reasoning_emitted)}, "
+                f"tool_calls={tr.call_index}, finish={finish})")
         except Exception as e:
+            # The HTTP status is already 200 — never fabricate assistant
+            # content or finish_reason=stop (Hermes would treat that as a
+            # successful provider answer). Emit a structured error event
+            # the client can identify, then terminate cleanly.
             log(f"STREAM ERROR: {e}")
             try:
-                await send(chunk(cid, model, delta=f"[proxy error] {e}"))
-                await send(chunk(cid, model, finish="stop"))
+                await send(StreamTranslator.error_payload(str(e)))
                 await send("[DONE]")
                 await resp.write_eof()
             except Exception:
@@ -1430,12 +1951,18 @@ def make_app(cli: str, work_dir: str, *,
 
 
 def _blocking_response(cid: str, model: str, text: str, tokens: dict,
-                       tool_calls: list[dict] | None = None) -> dict:
+                       tool_calls: list[dict] | None = None,
+                       reasoning_content: str | None = None) -> dict:
     prompt_tokens = int(tokens.get("input", 0)) + \
         int((tokens.get("cache") or {}).get("read", 0)) + \
         int((tokens.get("cache") or {}).get("write", 0))
     completion_tokens = int(tokens.get("output", 0))
-    message: dict = {"role": "assistant", "content": text}
+    message: dict = {"role": "assistant"}
+    if reasoning_content:
+        # Hermes reads non-streaming reasoning from message.reasoning_content;
+        # reasoning stays strictly separate from visible content.
+        message["reasoning_content"] = reasoning_content
+    message["content"] = text
     finish = "stop"
     if tool_calls:
         message["tool_calls"] = tool_calls

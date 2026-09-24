@@ -139,6 +139,41 @@ POST /v1/chat/completions
   free-tier 403). Instead the proxy injects a `[client tools]` prompt
   section and parses the model's `[tool_call]…[/tool_call]` blocks into
   OpenAI `tool_calls`.
+- A request-level hash of the effective tools + `tool_choice` rides on the
+  digest registry entry: changing the tool contract mid-conversation forces
+  a full resync instead of silently reusing a session staged for the old
+  tools.
+
+### Reasoning (thinking) translation
+
+OpenCode streams reasoning as a `reasoning` part; the proxy maps it to
+OpenAI's reasoning channel on both paths:
+
+- **Streaming** → `delta.reasoning_content` chunks (never `delta.content`).
+- **Blocking** → `message.reasoning_content` on the assistant message.
+- Reasoning is never persisted into the digest/memory layer (`last_reply`
+  stores the visible answer only) and never appears inside `content`.
+- Per-part state survives the documented OpenCode race where
+  `message.part.delta` can arrive *before* `message.part.updated`
+  (opencode#26924), and snapshot/delta overlap is deduplicated.
+- Reasoning never terminates a stream by itself: the final
+  `finish_reason` still reflects content or tool_calls semantics.
+- The `run` fallback always passes `--thinking` so the CLI emits reasoning
+  parts (without the flag they are dropped). Note: `run --format json`
+  reports complete parts only (no token-level deltas) — opencode#38638 —
+  so the fallback path batches reasoning/text per part while `serve`
+  streams live deltas.
+
+### Error semantics
+
+- Failures **before** the HTTP 200 is sent surface as a real error
+  response (HTTP 502 JSON `{"error": ...}`) so Hermes' retry/fallback
+  logic sees them.
+- Failures **mid-stream** (headers already sent) emit one structured
+  `data: {"error": {"message": ..., "type": "server_error"}}` event and
+  then `[DONE]` — the proxy never fabricates assistant content or a
+  `finish_reason` after a failure (a fake `stop` would be treated as a
+  successful provider answer).
 
 ## How memory works (no goldfish, no second database)
 
@@ -174,8 +209,10 @@ Three details matter for agentic clients:
    closes with `finish_reason` + `[DONE]` — the exact contract Hermes
    requires.
 
-Memory + tool-bridge behavior is pinned by `tests/test_memory.py` (stdlib
-`unittest`, no network needed):
+Memory + tool-bridge + reasoning behavior is pinned by
+`tests/test_memory.py` (unit) and `tests/test_stream.py` (wire-level SSE
+with a mocked EventHub — reasoning channels, race buffering, structured
+mid-stream errors) — stdlib `unittest`, no network or CLI needed:
 `.venv/bin/python -m unittest discover -s tests`, plus live turn-2 recall
 in `./test_proxy.sh` / `.\test_proxy.ps1`.
 
@@ -244,8 +281,10 @@ active backend (`serve:…` or `run`), agent, and registry size.
 - `GET /v1/models` → OpenAI model list (live free-tier catalog)
 - `POST /v1/chat/completions`, `POST /chat/completions` → OpenAI chat
   completion (blocking) or SSE stream when `"stream":true`;
-  accepts `tools` / `tool_choice` and returns OpenAI `tool_calls`
-- Errors from the backend surface as HTTP 502; malformed bodies get HTTP 400.
+  accepts `tools` / `tool_choice` and returns OpenAI `tool_calls`;
+  reasoning arrives as `delta.reasoning_content` / `message.reasoning_content`
+- Errors from the backend surface as HTTP 502 (pre-stream) or a structured
+  SSE error event (mid-stream); malformed bodies get HTTP 400.
   Inbound request bodies up to 64 MB are accepted (full histories welcome).
 
 ## Troubleshooting
@@ -266,9 +305,10 @@ active backend (`serve:…` or `run`), agent, and registry size.
 ## Project structure
 
 ```
-opencode_proxy.py                the proxy (aiohttp, digest registry, serve/run backends, tools bridge)
+opencode_proxy.py                the proxy (aiohttp, digest registry, serve/run backends, tools bridge, reasoning translator)
 .opencode/agents/bypass-lite.md  completion-backend agent ([tool_call] protocol, tools kept for 403 gate)
-tests/test_memory.py             memory/delta/wire/tools-bridge unit tests (stdlib only)
+tests/test_memory.py             memory/delta/wire/tools-bridge/reasoning unit tests (stdlib only)
+tests/test_stream.py             wire-level SSE tests (mocked EventHub, race + error semantics)
 install.sh / install.ps1         one-command install + autostart + verify (Linux / Windows)
 run.sh / run.ps1                 manual run/start/stop/restart/status/logs
 test_proxy.sh / test_proxy.ps1   live smoke test (health, models, stream, turn-2 recall, tools)

@@ -12,14 +12,58 @@ echo "== /v1/models =="
 $CURL "$BASE/v1/models"; echo
 
 echo "== non-streaming chat =="
-$CURL -X POST "$BASE/v1/chat/completions" \
+NONSTREAM=$($CURL -X POST "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model":"big-pickle","messages":[{"role":"user","content":"say hi in 3 words"}]}'; echo
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"say hi in 3 words"}]}')
+echo "$NONSTREAM"
+python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+msg=d["choices"][0]["message"]
+# reasoning_content is optional (model-dependent) but must be a string
+# separate from content when present
+rc=msg.get("reasoning_content")
+if rc is not None:
+    assert isinstance(rc,str), "reasoning_content must be string"
+    print("blocking reasoning_content OK:", len(rc), "chars")
+print("blocking content OK:", repr((msg.get("content") or "")[:60]))
+' <<<"$NONSTREAM"
 
 echo "== streaming chat =="
-$CURL -N -X POST "$BASE/v1/chat/completions" \
+STREAM_OUT=$($CURL -N -X POST "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model":"big-pickle","messages":[{"role":"user","content":"say hi in 3 words"}],"stream":true}'; echo
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"say hi in 3 words"}],"stream":true}')
+echo "$STREAM_OUT"
+python3 -c '
+import json,sys
+raw=sys.stdin.read()
+assert "[proxy error]" not in raw, "proxy fabricated [proxy error] content"
+lines=[l[6:] for l in raw.splitlines() if l.startswith("data: ")]
+assert lines, "no SSE data lines"
+assert lines[-1]=="[DONE]", "stream must end with [DONE], got %r" % lines[-1]
+first=json.loads(lines[0])
+assert first["choices"][0]["delta"].get("role")=="assistant", "first chunk must be role"
+# reasoning may be absent (model-dependent); when present it must never
+# appear inside content deltas
+reasoning=""; content=""
+for p in lines[1:-1]:
+    o=json.loads(p)
+    if "error" in o:
+        continue  # structured mid-stream error event (allowed, not content)
+    d=o["choices"][0].get("delta") or {}
+    reasoning+=d.get("reasoning_content") or ""
+    content+=d.get("content") or ""
+finishes=[json.loads(p)["choices"][0].get("finish_reason") for p in lines[1:-1]]
+finishes=[f for f in finishes if f]
+assert finishes, "missing finish_reason"
+if reasoning:
+    assert reasoning not in content or reasoning==content, "reasoning leaked into content"
+    assert not any(f=="stop" and not content for f in finishes) or content, "reasoning-only finish"
+    print("reasoning channel OK:", len(reasoning), "chars,", len(content), "content chars")
+else:
+    print("no reasoning this run (model-dependent), content chars:", len(content))
+print("stream structure OK: role first, finish=%r, [DONE] last" % finishes)
+' <<<"$STREAM_OUT"
 
 echo "== memory recall (turn 2, delta session) =="
 TURN1=$($CURL -X POST "$BASE/v1/chat/completions" \

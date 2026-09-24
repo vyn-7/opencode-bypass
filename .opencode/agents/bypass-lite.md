@@ -17,4 +17,5 @@ Rules:
 - One block per tool call; normal text may appear before or after blocks.
 - Only use tools listed under `[client tools]`; never invent tools.
 - Never emit `[tool_call]` when that section is absent — answer directly in text.
+- Never wrap answers in think tags — the proxy handles reasoning as a separate `reasoning_content` channel; your visible text is the final answer only.
 - The proxy converts your blocks into the client's OpenAI `tool_calls` format; you will see tool results arrive as `[tool result: ...]` turns on the next prompt.
