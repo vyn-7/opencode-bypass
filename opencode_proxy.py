@@ -141,6 +141,28 @@ MAX_BODY_BYTES = 64 * 1024 * 1024   # inbound Hermes history: no char limits
 MAX_ARG_CHARS = 120_000      # per-argv entry for `run` (kernel limit 131072)
 REGISTRY_MAX = 64            # conversation cursors kept (LRU)
 
+# Streaming transport/recovery (task: treat /event as an incremental transport
+# that may disconnect, stall, reorder metadata/deltas, or lose events).
+# All timeouts are based on actual event/byte activity, never total duration —
+# a request may legitimately run much longer than the idle timeout (long
+# thinking is normal for reasoning models).
+EVENT_STREAM_IDLE_TIMEOUT = float(
+    os.environ.get("OPENCODE_EVENT_IDLE_TIMEOUT", "150"))
+EVENT_RECONNECT_INITIAL = float(
+    os.environ.get("OPENCODE_EVENT_RECONNECT_INITIAL", "1.0"))
+EVENT_RECONNECT_MAX = float(
+    os.environ.get("OPENCODE_EVENT_RECONNECT_MAX", "16.0"))
+BUFFERED_DELTA_TTL = float(
+    os.environ.get("OPENCODE_BUFFERED_DELTA_TTL", "120"))
+SESSION_FETCH_TIMEOUT = float(
+    os.environ.get("OPENCODE_SESSION_FETCH_TIMEOUT", "10"))
+
+# Session health: a backend session that began mutating and then failed must
+# not be silently reused merely because the Hermes digest is unchanged.
+SESSION_HEALTHY = "healthy"
+SESSION_TAINTED = "tainted"
+SESSION_INVALID = "invalid"
+
 # Windows process creation flags (numeric so import works on POSIX).
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -178,6 +200,41 @@ def log(msg: str) -> None:
 def debug_log(msg: str) -> None:
     if DEBUG:
         log(f"[debug] {msg}")
+
+
+# Verbose payload logging is strictly opt-in (full event/part bodies can
+# contain private tool results or source). Normal runs log only protocol
+# metadata (counts, ids, names, booleans, finish reasons, transport/mode).
+VERBOSE_PAYLOADS = os.environ.get("OPENCODE_PROXY_VERBOSE_PAYLOADS", "").lower() in (
+    "1", "true", "yes", "on")
+
+
+def verbose_log(msg: str) -> None:
+    if VERBOSE_PAYLOADS:
+        log(f"[payload] {msg}")
+
+
+def slog(request_id: str, event: str, **fields) -> None:
+    """Structured streaming state-machine log (never secrets).
+
+    Always logs: request id + event name + supplied metadata fields.
+    Callers must only pass protocol metadata (sids truncated to 8 chars,
+    counts, ids, booleans, finish reasons) — never API keys, auth headers,
+    cookies, env secrets, full tool results, source code, or full bodies
+    (those stay behind VERBOSE_PAYLOADS).
+    """
+    try:
+        parts = [f"req={request_id}", f"ev={event}"]
+        for k, v in fields.items():
+            # Defensive redaction: drop anything that looks like a secret.
+            lk = str(k).lower()
+            if any(s in lk for s in ("key", "token", "auth", "cookie",
+                                     "secret", "password", "bearer")):
+                continue
+            parts.append(f"{k}={v}")
+        log("[stream] " + " ".join(parts))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -522,6 +579,11 @@ class Registry:
             # prefix still matches.
             "tools_sig": tools_sig,
             "used": time.time(),
+            # Session health: a successful completion always restores HEALTHY.
+            # Failures mark TAINTED/INVALID via mark_tainted/invalidate so the
+            # next turn forces a clean resync instead of reusing a partially
+            # mutated backend session.
+            "health": SESSION_HEALTHY,
         }
         self._entries = [e for e in self._entries
                          if not (e["backend"] == backend_kind and e["sid"] == sid)]
@@ -537,6 +599,36 @@ class Registry:
                digests[: len(e["digests"])] == e["digests"]:
                 return e
         return None
+
+    def mark_tainted(self, sid: str, backend_kind: str) -> bool:
+        """Mark a backend session TAINTED (do not silently reuse).
+
+        Returns True when an entry was found. A TAINTED session forces the
+        next safe request into a full resynchronization on a fresh backend
+        session (see lookup_entry). Backwards compatible: entries created
+        before health existed default to HEALTHY.
+        """
+        found = False
+        for e in self._entries:
+            if e.get("sid") == sid and e.get("backend") == backend_kind:
+                e["health"] = SESSION_TAINTED
+                e["used"] = time.time()
+                found = True
+        return found
+
+    def invalidate(self, sid: str, backend_kind: str) -> bool:
+        """Drop a registry entry entirely (INVALID -> fresh session next)."""
+        before = len(self._entries)
+        self._entries = [e for e in self._entries
+                         if not (e.get("sid") == sid
+                                 and e.get("backend") == backend_kind)]
+        return len(self._entries) != before
+
+    def health_of(self, sid: str, backend_kind: str) -> str:
+        for e in self._entries:
+            if e.get("sid") == sid and e.get("backend") == backend_kind:
+                return e.get("health", SESSION_HEALTHY)
+        return SESSION_INVALID
 
 
 def plan_prompt(msgs, entry: dict | None) -> tuple[str, str, dict]:
@@ -602,6 +694,12 @@ def lookup_entry(registry: "Registry", digests: list[str], backend_kind: str,
     if entry.get("tools_sig", "") != tools_sig:
         # Tools/tool_choice changed mid-conversation -> force resync; the
         # stale entry stays (it becomes valid again if the contract returns).
+        return None
+    if entry.get("health", SESSION_HEALTHY) != SESSION_HEALTHY:
+        # TAINTED/INVALID sessions must never be silently reused: a streamed
+        # backend response began and then failed (or could not be reconciled),
+        # so the backend session may be partially mutated even though the
+        # Hermes digest is unchanged. Force a fresh session + full replay.
         return None
     return entry
 
@@ -1069,7 +1167,8 @@ class _PartState:
     """Per-part streaming state for one request (never persisted)."""
 
     __slots__ = ("ptype", "emitted", "buffered", "snap_covered",
-                 "snap_consumed")
+                 "snap_consumed", "created_at", "buffered_at", "field",
+                 "seq")
 
     def __init__(self) -> None:
         self.ptype: str | None = None
@@ -1080,6 +1179,14 @@ class _PartState:
         # reverse of opencode#26924 without eating genuinely new content.
         self.snap_covered: str = ""
         self.snap_consumed: int = 0
+        # Bounded-lifetime buffering for the dangerous case where
+        # message.part.delta arrives but message.part.updated never does.
+        # Never guess field=="text" means visible content — resolution must
+        # consult authoritative session state (reasoning vs text separate).
+        self.created_at: float = time.monotonic()
+        self.buffered_at: float | None = None  # first buffered delta time
+        self.field: str | None = None  # last seen delta field (metadata only)
+        self.seq: int = 0  # order counter for deltas on this part
 
 
 class StreamTranslator:
@@ -1313,12 +1420,20 @@ class StreamTranslator:
             return []
         st = self._part(pid)
         if st.ptype is None:
-            st.buffered.append(delta)  # type unknown -> buffer, never drop
+            # Type unknown -> buffer with bounded lifetime, never drop
+            # immediately and never guess field=="text" means visible content.
+            st.buffered.append(delta)
+            now = time.monotonic()
+            if st.buffered_at is None:
+                st.buffered_at = now
+            st.field = field
+            st.seq += 1
             return []
         if self._delta_guarded(st, delta):
             return []
         out = self._route(st.ptype, delta)
         st.emitted += delta
+        st.seq += 1
         return out
 
     def handle_session(self, evt, sid: str) -> list[str]:
@@ -1359,6 +1474,170 @@ class StreamTranslator:
                 _, pid, field, delta = ev
                 out += self._handle_delta(pid, mid, field, delta)
         return out
+
+    # ---- recovery: stale buffers + session-state reconciliation -----------
+    def unknown_pending(self) -> list[str]:
+        """Part ids with buffered deltas but still-unknown type."""
+        return [pid for pid, st in self.parts.items()
+                if st.ptype is None and st.buffered]
+
+    def stale_unknown(self, now: float | None = None,
+                      ttl: float | None = None) -> list[str]:
+        """Unknown-type buffers whose bounded lifetime has expired."""
+        if now is None:
+            now = time.monotonic()
+        if ttl is None:
+            ttl = BUFFERED_DELTA_TTL
+        out = []
+        for pid, st in self.parts.items():
+            if st.ptype is not None or not st.buffered:
+                continue
+            born = st.buffered_at if st.buffered_at is not None \
+                else st.created_at
+            if now - born >= ttl:
+                out.append(pid)
+        return out
+
+    def has_stale_unknown(self, now: float | None = None,
+                          ttl: float | None = None) -> bool:
+        return bool(self.stale_unknown(now, ttl))
+
+    def streamed_offsets(self) -> dict:
+        """Per-part streamed offsets for logging/tests (no bodies)."""
+        return {pid: {"type": st.ptype, "emitted_len": len(st.emitted),
+                      "buffered_len": sum(len(b) for b in st.buffered),
+                      "seq": st.seq}
+                for pid, st in self.parts.items()}
+
+    def resolve_unknown_via_session(self, session_parts) -> list[str]:
+        """Flush stale unknown buffers using authoritative session state.
+
+        ``session_parts`` is a list of OpenCode part dicts (id/type/text).
+        Never guesses field=="text" means content: the part type decides the
+        channel (reasoning vs text vs drop). Unknown ids stay buffered for a
+        later retry — they are never fabricated as content.
+        """
+        out: list[str] = []
+        if not session_parts:
+            return out
+        by_id = {p.get("id"): p for p in session_parts
+                 if isinstance(p, dict) and p.get("id")}
+        for pid in self.unknown_pending():
+            part = by_id.get(pid)
+            if not isinstance(part, dict):
+                continue  # still unknown: keep buffered, retry later
+            # Reuse the normal registration path so snapshot/buffer merge
+            # stays single-sourced (no duplicate bytes).
+            out += self._register_part_now(part)
+        return out
+
+    def reconcile_with_session_parts(self, session_parts) -> list[str]:
+        """Emit only missing authoritative info after a stall/disconnect.
+
+        Handles both unknown-type resolution and per-part tails without
+        replaying already-delivered bytes, duplicating tool calls, or moving
+        reasoning into content. Returns OpenAI SSE payloads (no finish).
+        """
+        out: list[str] = []
+        # 1. Resolve unknown buffers first (correct channel matters).
+        out += self.resolve_unknown_via_session(session_parts)
+        if not session_parts:
+            return out
+        # 2. Per-part tails for known text/reasoning parts.
+        by_id = {p.get("id"): p for p in session_parts
+                 if isinstance(p, dict) and p.get("id")}
+        for pid, part in by_id.items():
+            st = self.parts.get(pid)
+            if st is None or st.ptype is None:
+                continue  # handled above or non-streamed part
+            if st.ptype not in ("text", "reasoning"):
+                continue
+            snap = _part_snapshot(part)
+            if not snap:
+                continue
+            # _apply_snapshot with initial=False emits only the missing tail
+            # and suppresses duplicates/divergence safely.
+            out += self._apply_snapshot(st, snap, initial=False)
+        return out
+
+    def reconcile_with_messages(self, messages) -> list[str]:
+        """Reconcile against GET /session/{sid}/message output.
+
+        ``messages`` is the authoritative list [{info, parts}]. Only the
+        parts of assistant messages are considered; user parts are ignored.
+        Emits only missing tails (no finish chunk, no [DONE]).
+        """
+        parts: list[dict] = []
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            info = m.get("info") or {}
+            # Envelope shape from prompt() is {info, parts}; fetch shape is
+            # [{info, parts}]. Only reconcile assistant content.
+            role = info.get("role")
+            # Some payloads nest parts at top level; be lenient.
+            plist = m.get("parts")
+            if role is not None and role != "assistant":
+                continue
+            if isinstance(plist, list):
+                parts.extend(p for p in plist if isinstance(p, dict))
+        # Bridge case: authoritative full text may extend parser.raw. The
+        # per-part path above already handles tails, but tool-call text needs
+        # the parser-level tail too when parts lack granular snapshots.
+        out = self.reconcile_with_session_parts(parts)
+        if self.parser is not None and parts:
+            auth_text, auth_reason = split_envelope_parts(parts)
+            # Reasoning tail via global channel (per-part already covered;
+            # _tail is idempotent so double-call emits nothing new).
+            if auth_reason:
+                r_tail = self._tail(auth_reason, self.reasoning_emitted)
+                if r_tail:
+                    piece = self.feed_reasoning(r_tail)
+                    if piece:
+                        out.append(piece)
+            # Text tail for bridge: only when authoritative raw extends the
+            # parser buffer (avoids duplicating stripped content).
+            if auth_text and auth_text.startswith(self.parser.raw):
+                tail_raw = auth_text[len(self.parser.raw):]
+                if tail_raw:
+                    out.extend(self.feed_content(tail_raw))
+        elif parts:
+            # Non-bridge global tails are already covered per-part, but keep
+            # the envelope-level fallback for sessions whose part ids rotated
+            # (new ids after reconnect) — emit only truly missing bytes.
+            auth_text, auth_reason = split_envelope_parts(parts)
+            r_tail = self._tail(auth_reason or "", self.reasoning_emitted)
+            if r_tail:
+                piece = self.feed_reasoning(r_tail)
+                if piece:
+                    out.append(piece)
+            c_tail = self._tail(auth_text or "", self.content_emitted)
+            # Only emit if no per-part emission already covered it: check
+            # that the tail is not already represented in per-part offsets.
+            if c_tail and not out:
+                self.content_emitted += c_tail
+                out.append(chunk(self.cid, self.model,
+                                 delta={"content": c_tail}))
+        return out
+
+    def is_divergent(self, final_text: str, final_reasoning: str) -> bool:
+        """Whether the final envelope contradicts already-streamed state."""
+        # Tool-bridge finals are authoritative via parser.finish (markers
+        # stripped) — divergence there is expected, not a taint signal.
+        if self.parser is not None:
+            return False
+        ft = final_text or ""
+        fr = final_reasoning or ""
+        ce = self.content_emitted or ""
+        re_ = self.reasoning_emitted or ""
+        def _div(final: str, emitted: str) -> bool:
+            if not final and not emitted:
+                return False
+            if not final or not emitted:
+                return False  # empty side is not contradiction
+            return not (final.startswith(emitted)
+                        or emitted.startswith(final))
+        return _div(ft, ce) or _div(fr, re_)
 
     # ---- completion ------------------------------------------------------
     @staticmethod
@@ -1420,19 +1699,137 @@ class StreamTranslator:
 
 
 # --------------------------------------------------------------------------
+# Session-state helpers (authoritative recovery source)
+# --------------------------------------------------------------------------
+
+def latest_assistant_parts(messages) -> list[dict]:
+    """Parts of the latest assistant message in a fetch payload."""
+    latest: list[dict] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        info = m.get("info") or {}
+        if info.get("role") != "assistant":
+            continue
+        plist = m.get("parts")
+        if isinstance(plist, list):
+            latest = [p for p in plist if isinstance(p, dict)]
+    return latest
+
+
+def all_session_parts(messages) -> list[dict]:
+    """All assistant parts across a fetch payload (for reconciliation)."""
+    out: list[dict] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        info = m.get("info") or {}
+        if info.get("role") is not None and info.get("role") != "assistant":
+            continue
+        plist = m.get("parts")
+        if isinstance(plist, list):
+            out.extend(p for p in plist if isinstance(p, dict))
+    return out
+
+
+# --------------------------------------------------------------------------
 # Event hub: one shared SSE reader on serve's global /event
 # --------------------------------------------------------------------------
 
 class EventHub:
-    def __init__(self, base_url: str, headers: dict):
+    """Single shared SSE reader with inactivity watchdog + safe reconnect.
+
+    State machine (logged): CONNECTED -> ACTIVE <-> IDLE -> STALE ->
+    RECONNECTING -> CONNECTED ... -> FAILED (only when subscribers remain
+    and reconnects keep failing; FAILED still retries with capped backoff).
+
+    Guarantees:
+
+    * exactly one active ``/event`` reader at a time (no duplicate
+      consumers); reconnects never create a second competing loop;
+    * reconnects never emit duplicate output themselves — deduplication
+      lives in :class:`StreamTranslator` (snapshot/delta guards) plus the
+      session-state reconciliation layer (authoritative fetch);
+    * bounded exponential backoff ``1s, 2s, 4s, 8s, 16s`` (configurable max),
+      reset after any successfully parsed event;
+    * cancellation-safe: ``CancelledError`` always propagates; ``unsubscribe``
+      never cancels a loop still serving other subscribers;
+    * malformed SSE lines never kill the hub (skipped + counted).
+    """
+
+    def __init__(self, base_url: str, headers: dict,
+                 idle_timeout: float | None = None,
+                 reconnect_initial: float | None = None,
+                 reconnect_max: float | None = None):
         self.base_url = base_url.rstrip("/")
         self.headers = headers
         self._subs: set[asyncio.Queue] = set()
         self._task: asyncio.Task | None = None
         self._session: ClientSession | None = None
+        self._explicit_idle = idle_timeout is not None
+        self._explicit_reconnect_initial = reconnect_initial is not None
+        self._explicit_reconnect_max = reconnect_max is not None
+        self._idle_timeout = float(idle_timeout) if idle_timeout is not None \
+            else float(EVENT_STREAM_IDLE_TIMEOUT)
+        self._reconnect_initial = float(reconnect_initial) \
+            if reconnect_initial is not None \
+            else float(EVENT_RECONNECT_INITIAL)
+        self._reconnect_max = float(reconnect_max) \
+            if reconnect_max is not None else float(EVENT_RECONNECT_MAX)
+        # Observability (no bodies, only metadata).
+        self._conn_id = 0
+        self._state = "IDLE"
+        self._connect_time = 0.0
+        self._last_activity = 0.0
+        self._last_event_type = ""
+        self._bytes = 0
+        self._events = 0
+        self._malformed = 0
+        self._reconnects = 0
 
     def set_session(self, session: ClientSession) -> None:
         self._session = session
+
+    @property
+    def idle_timeout(self) -> float:
+        # Explicit constructor values win (unit tests); otherwise read the
+        # module global dynamically so CLI/env patches apply without
+        # rebuilding the hub.
+        if getattr(self, "_explicit_idle", False):
+            return self._idle_timeout
+        try:
+            return float(EVENT_STREAM_IDLE_TIMEOUT)
+        except Exception:
+            return self._idle_timeout
+
+    @property
+    def reconnect_max(self) -> float:
+        if getattr(self, "_explicit_reconnect_max", False):
+            return self._reconnect_max
+        try:
+            return float(EVENT_RECONNECT_MAX)
+        except Exception:
+            return self._reconnect_max
+
+    @property
+    def reconnect_initial(self) -> float:
+        if getattr(self, "_explicit_reconnect_initial", False):
+            return self._reconnect_initial
+        try:
+            return float(EVENT_RECONNECT_INITIAL)
+        except Exception:
+            return self._reconnect_initial
+
+    def stats(self) -> dict:
+        return {
+            "conn": self._conn_id,
+            "state": self._state,
+            "bytes": self._bytes,
+            "events": self._events,
+            "malformed": self._malformed,
+            "reconnects": self._reconnects,
+            "last_event": self._last_event_type,
+        }
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -1445,8 +1842,16 @@ class EventHub:
         self._subs.discard(q)
 
     async def _run(self) -> None:
-        backoff = 0.5
+        backoff = self.reconnect_initial
         while self._subs:
+            self._conn_id += 1
+            conn = self._conn_id
+            self._state = "CONNECTED"
+            self._connect_time = time.monotonic()
+            self._last_activity = self._connect_time
+            connect_wall = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log(f"event hub: conn={conn} CONNECTED at {connect_wall} "
+                f"(subs={len(self._subs)})")
             try:
                 assert self._session is not None
                 async with self._session.get(
@@ -1456,25 +1861,99 @@ class EventHub:
                 ) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"/event HTTP {resp.status}")
-                    backoff = 0.5
-                    async for raw in resp.content:
-                        line = raw.decode("utf-8", "replace").strip()
-                        if not line.startswith("data:"):
-                            continue
+                    self._state = "ACTIVE"
+                    idle = self.idle_timeout
+                    buf = ""
+                    while self._subs:
                         try:
-                            evt = json.loads(line[5:])
-                        except json.JSONDecodeError:
+                            raw = await asyncio.wait_for(
+                                resp.content.readany(), timeout=idle)
+                        except asyncio.TimeoutError:
+                            # STALE: no bytes/events for idle_timeout. Close
+                            # and reconnect; per-request recovery reconciles
+                            # via authoritative session state.
+                            self._state = "STALE"
+                            idle_for = time.monotonic() - self._last_activity
+                            log(f"event hub: conn={conn} STALE "
+                                f"(idle={idle_for:.1f}s>={idle:.0f}s "
+                                f"events={self._events} "
+                                f"last={self._last_event_type or '-'}) "
+                                f"-> reconnect")
+                            break
+                        if not raw:
+                            # Clean EOF (server closed): reconnect.
+                            log(f"event hub: conn={conn} EOF "
+                                f"(events={self._events}) -> reconnect")
+                            break
+                        self._bytes += len(raw)
+                        self._last_activity = time.monotonic()
+                        if self._state != "ACTIVE":
+                            self._state = "ACTIVE"
+                        try:
+                            text = raw.decode("utf-8", "replace")
+                        except Exception:
                             continue
-                        for q in list(self._subs):
-                            q.put_nowait(evt)
+                        buf += text
+                        # SSE framing: one or more lines per chunk, partial
+                        # lines span chunks. Split complete lines, keep tail.
+                        lines = buf.split("\n")
+                        buf = lines.pop()
+                        for line in lines:
+                            s = line.strip()
+                            if not s:
+                                continue
+                            if s.startswith(":"):
+                                # keep-alive comment: byte activity only.
+                                verbose_log(f"hub conn={conn} keep-alive")
+                                continue
+                            if not s.startswith("data:"):
+                                continue
+                            payload = s[5:].strip()
+                            if not payload:
+                                continue
+                            try:
+                                evt = json.loads(payload)
+                            except json.JSONDecodeError:
+                                self._malformed += 1
+                                debug_log(
+                                    f"hub conn={conn} malformed SSE skipped "
+                                    f"(total_malformed={self._malformed})")
+                                continue
+                            self._events += 1
+                            try:
+                                self._last_event_type = str(evt.get("type", ""))
+                            except Exception:
+                                self._last_event_type = "?"
+                            self._last_activity = time.monotonic()
+                            # Successful event resets backoff (spec).
+                            backoff = self.reconnect_initial
+                            verbose_log(f"hub conn={conn} evt="
+                                        f"{self._last_event_type}")
+                            for q in list(self._subs):
+                                try:
+                                    q.put_nowait(evt)
+                                except asyncio.QueueFull:
+                                    pass
+                    # Inner loop broke (STALE/EOF): fall through to reconnect.
+                    raise RuntimeError(f"/event stale/eof conn={conn}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # reconnect until subscribers go away
                 if not self._subs:
                     break
-                log(f"event hub: {e!r}; reconnect in {backoff:.1f}s")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 5.0)
+                self._state = "RECONNECTING"
+                self._reconnects += 1
+                # Cap backoff; reset happens on next successful event.
+                capped = min(max(backoff, 0.1), self.reconnect_max)
+                log(f"event hub: conn={conn} RECONNECTING "
+                    f"({e!r}; retry in {capped:.1f}s, "
+                    f"reconnects={self._reconnects})")
+                try:
+                    await asyncio.sleep(capped)
+                except asyncio.CancelledError:
+                    raise
+                backoff = min(capped * 2, self.reconnect_max)
+                self._state = "IDLE"
 
 
 # --------------------------------------------------------------------------
@@ -1701,6 +2180,35 @@ class ServeBackend:
             if resp.status != 200:
                 raise RuntimeError(f"prompt failed: HTTP {resp.status} "
                                    f"{json.dumps(data)[:300]}")
+            return data
+
+    async def fetch_messages(self, sid: str) -> list[dict]:
+        """Authoritative session state for reconciliation.
+
+        ``GET /session/{sid}/message`` returns ``[{info, parts}]`` covering
+        everything the backend has stored — including partial assistant
+        output emitted while ``/event`` was stalled/disconnected. Used to
+        recover missed reasoning/text/tool-call bytes without replaying the
+        whole session. Raises on HTTP/transport failure (caller decides
+        whether to taint the session).
+        """
+        timeout = SESSION_FETCH_TIMEOUT
+        try:
+            timeout = float(SESSION_FETCH_TIMEOUT)
+        except Exception:
+            timeout = 10.0
+        async with self.http.get(
+            f"{self._url}/session/{sid}/message",
+            headers=self._headers,
+            timeout=ClientTimeout(total=timeout),
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"session fetch failed: HTTP {resp.status} "
+                    f"{json.dumps(data)[:300] if isinstance(data, dict) else str(data)[:300]}")
+            if not isinstance(data, list):
+                raise RuntimeError("session fetch: unexpected envelope shape")
             return data
 
 
@@ -2057,22 +2565,159 @@ def make_app(cli: str, work_dir: str, *,
         bridge = bool(tools_list)
         tr = StreamTranslator(cid, model, bridge)
         finish = "stop"
+        # Structured per-request state for observability (no bodies).
+        _hermes_prefix = (digs[0][:8] if digs else "empty")
+        _sid_short = (sid[-8:] if isinstance(sid, str) and sid else "new")
         try:
             await send(tr.role_chunk())
             q = state["hub"].subscribe()
+            try:
+                _hub_stats = state["hub"].stats()
+            except Exception:
+                _hub_stats = {}
+            slog(cid, "connect",
+                 hermes=_hermes_prefix, sid=_sid_short, mode=mode,
+                 hub_conn=_hub_stats.get("conn", "?"),
+                 hub_state=_hub_stats.get("state", "?"))
 
             if kind == "serve":
                 post = asyncio.create_task(backend.prompt(sid, prompt, model))
+                last_activity = time.monotonic()
+                connect_time = last_activity
+                last_event_type = "-"
+                events_seen = 0
+                stalls = 0
+                reconciles = 0
+                last_fetch = 0.0
+                last_hub_conn = _hub_stats.get("conn", 0)
 
                 async def pump_evt(evt) -> None:
+                    nonlocal last_activity, last_event_type, events_seen
+                    nonlocal last_hub_conn
+                    last_activity = time.monotonic()
+                    try:
+                        last_event_type = str(evt.get("type", "?")) \
+                            if isinstance(evt, dict) else "?"
+                    except Exception:
+                        last_event_type = "?"
+                    events_seen += 1
+                    try:
+                        cur_conn = state["hub"].stats().get("conn", "?")
+                    except Exception:
+                        cur_conn = "?"
+                    if cur_conn != last_hub_conn:
+                        slog(cid, "reconnect-success",
+                             sid=_sid_short, hub_conn=cur_conn,
+                             events=events_seen, last_event=last_event_type)
+                        last_hub_conn = cur_conn
+                    verbose_log(f"req={cid} evt={last_event_type} "
+                                f"sid={_sid_short}")
                     for payload in tr.handle_session(evt, sid):
                         await send(payload)
 
-                # pump queue while the blocking prompt runs
+                async def _try_reconcile(reason: str) -> int:
+                    """Fetch authoritative state + emit only missing bytes.
+
+                    Returns number of SSE payloads emitted (0 = no progress).
+                    Never duplicates tool calls (parser tracks emitted_calls),
+                    never moves reasoning into content, never fabricates.
+                    """
+                    nonlocal last_fetch, reconciles, last_activity
+                    now = time.monotonic()
+                    last_fetch = now
+                    slog(cid, "reconciliation-start",
+                         sid=_sid_short, reason=reason,
+                         unknown=len(tr.unknown_pending()),
+                         events=events_seen, last_event=last_event_type)
+                    try:
+                        fetch_timeout = float(SESSION_FETCH_TIMEOUT)
+                    except Exception:
+                        fetch_timeout = 10.0
+                    try:
+                        msgs = await asyncio.wait_for(
+                            backend.fetch_messages(sid),
+                            timeout=fetch_timeout + 2.0)
+                    except Exception as e:
+                        slog(cid, "reconciliation-result",
+                             sid=_sid_short, reason=reason,
+                             result=f"fetch-failed: {e!r}")
+                        return 0
+                    try:
+                        payloads = tr.reconcile_with_messages(msgs)
+                    except Exception as e:
+                        slog(cid, "reconciliation-result",
+                             sid=_sid_short, reason=reason,
+                             result=f"reconcile-error: {e!r}")
+                        return 0
+                    for payload in payloads:
+                        await send(payload)
+                    if payloads:
+                        reconciles += 1
+                        last_activity = time.monotonic()
+                        slog(cid, "reconciliation-result",
+                             sid=_sid_short, reason=reason,
+                             result=f"recovered={len(payloads)} "
+                                    f"content={len(tr.content_emitted)} "
+                                    f"reasoning={len(tr.reasoning_emitted)} "
+                                    f"calls={tr.call_index}")
+                    else:
+                        slog(cid, "reconciliation-result",
+                             sid=_sid_short, reason=reason,
+                             result="no-missing-bytes")
+                    # Duplicate suppression is inherent: reconcile emits only
+                    # tails (_apply_snapshot guards), so already-delivered
+                    # bytes are never re-sent.
+                    return len(payloads)
+
+                # pump queue while the blocking prompt runs; idle watchdog is
+                # based on actual event/byte activity, not total duration.
                 while not post.done():
                     try:
                         evt = await asyncio.wait_for(q.get(), timeout=1.0)
                     except asyncio.TimeoutError:
+                        now = time.monotonic()
+                        idle_for = now - last_activity
+                        # Bounded-lifetime buffered deltas: part metadata
+                        # never arrived -> consult authoritative state.
+                        if tr.has_stale_unknown(now) and \
+                                now - last_fetch >= 5.0:
+                            slog(cid, "stale-buffer",
+                                 sid=_sid_short, idle_for=f"{idle_for:.1f}s",
+                                 unknown=tr.unknown_pending(),
+                                 offsets=tr.streamed_offsets())
+                            await _try_reconcile("stale-buffer")
+                            now = time.monotonic()
+                            idle_for = now - last_activity
+                        try:
+                            idle_timeout = float(EVENT_STREAM_IDLE_TIMEOUT)
+                        except Exception:
+                            idle_timeout = 150.0
+                        if idle_for >= idle_timeout:
+                            stalls += 1
+                            try:
+                                hub_st = state["hub"].stats()
+                            except Exception:
+                                hub_st = {}
+                            slog(cid, "stall-detected",
+                                 sid=_sid_short, idle_for=f"{idle_for:.1f}s",
+                                 idle_timeout=f"{idle_timeout:.0f}s",
+                                 events=events_seen,
+                                 last_event=last_event_type,
+                                 hub_conn=hub_st.get("conn", "?"),
+                                 hub_state=hub_st.get("state", "?"),
+                                 hub_events=hub_st.get("events", "?"))
+                            # Distinguish long thinking from dead stream via
+                            # backend session state: if the fetch shows new
+                            # bytes, recovery continues the stream; if not,
+                            # keep waiting (thinking) but throttle retries to
+                            # one fetch per idle_timeout window.
+                            n = await _try_reconcile("stall")
+                            if n == 0:
+                                slog(cid, "stall-no-progress",
+                                     sid=_sid_short,
+                                     note="backend fetch ok but no new bytes; "
+                                          "continuing (long thinking?)")
+                                last_activity = time.monotonic()
                         continue
                     await pump_evt(evt)
                 # quiet drain for straggler deltas after completion
@@ -2091,12 +2736,70 @@ def make_app(cli: str, work_dir: str, *,
                         err.get("name") or "backend error"
                     raise RuntimeError(msg)
                 raw_parts = envelope.get("parts", [])
+                # Final authoritative reconciliation: emit only not-yet-sent
+                # tails (per-part offsets), never duplicate reasoning/text/
+                # tool calls. Exactly one [DONE] comes from finalize.
+                n_before_c = len(tr.content_emitted)
+                n_before_r = len(tr.reasoning_emitted)
+                n_before_calls = tr.call_index
                 payloads, text, reasoning = tr.finalize_parts(raw_parts)
                 for payload in payloads:
                     await send(payload)
-                registry.record(rec["digests"], kind, sid, text,
-                                tools_sig=tools_sig)
+                slog(cid, "final-reconciliation",
+                     sid=_sid_short, streamed_c=n_before_c,
+                     streamed_r=n_before_r, streamed_calls=n_before_calls,
+                     final_c=len(text), final_r=len(reasoning),
+                     emitted_c=len(tr.content_emitted),
+                     emitted_r=len(tr.reasoning_emitted),
+                     emitted_calls=tr.call_index,
+                     finish=("tool_calls" if tr.call_index else "stop"))
+                # If the final envelope contradicts streamed state (non-bridge
+                # divergence) or tool boundaries are ambiguous, the backend
+                # session may be partially mutated -> taint so the next turn
+                # resyncs on a fresh session instead of reusing it.
+                _ambiguous_tools = False
+                try:
+                    _auth_text_dbg, _auth_reas_dbg = \
+                        split_envelope_parts(raw_parts)
+                    # Ambiguous when streamed calls exist but final has no
+                    # tool markers, or vice versa (excluding bridge parsing
+                    # which is authoritative via parser.finish).
+                    if not bridge:
+                        _has_markers = (
+                            TOOL_OPEN_XML in (_auth_text_dbg or "")
+                            or TOOL_OPEN_BRACKET in (_auth_text_dbg or ""))
+                        if bool(tr.call_index) != bool(_has_markers) and \
+                                (text or reasoning or tr.content_emitted):
+                            # Only taint when there was real streamed output
+                            # to contradict (avoid tainting empty turns).
+                            if tr.content_emitted or tr.reasoning_emitted:
+                                _ambiguous_tools = True
+                except Exception:
+                    pass
+                _divergent = False
+                try:
+                    _divergent = tr.is_divergent(text, reasoning)
+                except Exception:
+                    pass
+                if _divergent or _ambiguous_tools:
+                    try:
+                        registry.mark_tainted(sid, kind)
+                    except Exception:
+                        pass
+                    slog(cid, "session-tainted",
+                         sid=_sid_short,
+                         reason=("divergent-final"
+                                 if _divergent else "ambiguous-tools"))
+                else:
+                    registry.record(rec["digests"], kind, sid, text,
+                                    tools_sig=tools_sig)
                 tokens = info.get("tokens") or {}
+                slog(cid, "active",
+                     sid=_sid_short, events=events_seen,
+                     stalls=stalls, reconciles=reconciles,
+                     last_event=last_event_type,
+                     bytes_content=len(tr.content_emitted),
+                     bytes_reasoning=len(tr.reasoning_emitted))
                 if DEBUG:
                     _raw_dbg, _reas_dbg = split_envelope_parts(raw_parts)
                     _debug_tool_turn(
@@ -2146,6 +2849,10 @@ def make_app(cli: str, work_dir: str, *,
             if tr.reasoning_emitted:
                 log(f"reasoning: {len(tr.reasoning_emitted)} chars")
             await resp.write_eof()
+            slog(cid, "done",
+                 sid=_sid_short, content=len(tr.content_emitted),
+                 reasoning=len(tr.reasoning_emitted),
+                 tool_calls=tr.call_index, finish=finish)
             log(f"-> done (stream, content={len(tr.content_emitted)}, "
                 f"reasoning={len(tr.reasoning_emitted)}, "
                 f"tool_calls={tr.call_index}, finish={finish})")
@@ -2153,8 +2860,37 @@ def make_app(cli: str, work_dir: str, *,
             # The HTTP status is already 200 — never fabricate assistant
             # content or finish_reason=stop (Hermes would treat that as a
             # successful provider answer). Emit a structured error event
-            # the client can identify, then terminate cleanly.
+            # the client can identify, then terminate cleanly. [DONE] here
+            # terminates the failed turn; it is NOT a successful finish
+            # (no finish_reason was ever sent). Successful turns emit [DONE]
+            # exactly once via finalize_*; failed turns emit error + [DONE]
+            # exactly once here — never both.
+            slog(cid, "stream-error",
+                 sid=_sid_short, error=str(e)[:200],
+                 streamed_c=len(tr.content_emitted),
+                 streamed_r=len(tr.reasoning_emitted),
+                 streamed_calls=tr.call_index)
             log(f"STREAM ERROR: {e}")
+            # TAINTED: backend output began but the turn failed -> the
+            # persistent session may be partially mutated. Next request must
+            # resync on a fresh session even if the Hermes digest matches.
+            try:
+                _had_output = bool(tr.content_emitted or
+                                   tr.reasoning_emitted or tr.call_index)
+                # events_seen only exists on the serve path; be lenient.
+                try:
+                    _had_output = _had_output or (events_seen > 0)
+                except NameError:
+                    pass
+                if _had_output and isinstance(sid, str) and sid:
+                    try:
+                        registry.mark_tainted(sid, kind)
+                    except Exception:
+                        pass
+                    slog(cid, "session-tainted",
+                         sid=_sid_short, reason="partial-turn-failed")
+            except Exception:
+                pass
             try:
                 await send(StreamTranslator.error_payload(str(e)))
                 await send("[DONE]")
@@ -2283,10 +3019,43 @@ def main() -> None:
                     default=os.environ.get("OPENCODE_PROXY_DEBUG", "")
                     .lower() in ("1", "true", "yes", "on"),
                     help="verbose per-turn tool-call diagnostics (no secrets)")
+    ap.add_argument("--event-idle-timeout", type=float,
+                    default=float(os.environ.get(
+                        "OPENCODE_EVENT_IDLE_TIMEOUT", "150")),
+                    help="seconds without /event bytes/events before the "
+                         "stream is declared stale (default 150; "
+                         "conservative for long thinking)")
+    ap.add_argument("--event-reconnect-initial", type=float,
+                    default=float(os.environ.get(
+                        "OPENCODE_EVENT_RECONNECT_INITIAL", "1.0")),
+                    help="initial /event reconnect backoff in seconds")
+    ap.add_argument("--event-reconnect-max", type=float,
+                    default=float(os.environ.get(
+                        "OPENCODE_EVENT_RECONNECT_MAX", "16.0")),
+                    help="maximum /event reconnect backoff in seconds")
+    ap.add_argument("--buffered-delta-ttl", type=float,
+                    default=float(os.environ.get(
+                        "OPENCODE_BUFFERED_DELTA_TTL", "120")),
+                    help="bounded lifetime for deltas buffered while part "
+                         "type is unknown (default 120s)")
+    ap.add_argument("--verbose-payloads", action="store_true",
+                    default=os.environ.get(
+                        "OPENCODE_PROXY_VERBOSE_PAYLOADS", "")
+                    .lower() in ("1", "true", "yes", "on"),
+                    help="opt-in full SSE payload logging (may contain "
+                         "private data; off by default)")
     args = ap.parse_args()
-    global DEBUG
+    global DEBUG, VERBOSE_PAYLOADS
+    global EVENT_STREAM_IDLE_TIMEOUT, EVENT_RECONNECT_INITIAL
+    global EVENT_RECONNECT_MAX, BUFFERED_DELTA_TTL
     if args.debug:
         DEBUG = True
+    if args.verbose_payloads:
+        VERBOSE_PAYLOADS = True
+    EVENT_STREAM_IDLE_TIMEOUT = float(args.event_idle_timeout)
+    EVENT_RECONNECT_INITIAL = float(args.event_reconnect_initial)
+    EVENT_RECONNECT_MAX = float(args.event_reconnect_max)
+    BUFFERED_DELTA_TTL = float(args.buffered_delta_ttl)
 
     try:
         cli = find_cli(args.cli)
