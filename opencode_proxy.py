@@ -21,11 +21,21 @@ truncated or summarized by the adapter. Efficiency comes from using the
 backend's own session state instead of replaying history every call:
 
   * a digest-prefix registry (sha256 per message — cursors, not a transcript)
-    maps an OpenAI conversation to an ``opencode serve`` session id;
-  * append-only turns send only the *delta* (new messages) to the existing
-    session — the backend already holds the prefix;
-  * if Hermes compresses/edits history (digest divergence), the adapter
-    resyncs: fresh session + full authoritative replay;
+    maps an OpenAI conversation to an ``opencode serve`` session id
+    (+ ``last_reply`` / ``last_reasoning`` content cursors + tools_sig);
+  * append-only turns send only the deduped *delta* (genuinely new tail
+    state) to the existing session — the backend already holds the prefix
+    (prior reasoning + tool-call text natively, prior user prompt as the
+    stored prefix). Replayed assistant reasoning/visible content equal to
+    the stored cursors is stripped; only the minimal ``[assistant tool
+    calls]`` ID replay + new ``[tool result]`` blocks are sent;
+  * the ``[client tools]`` contract is sent on session creation / resync
+    only — never resent on append-only deltas with an unchanged
+    ``tools_signature`` (a changed signature forces a resync);
+  * if Hermes compresses/edits history (digest divergence), the proxy
+    restarts (registry loss), the session is missing/tainted, or the tool
+    contract changes, the adapter resyncs: fresh session + full
+    authoritative replay (reasoning + tool calls + IDs + results + order);
   * the previous assistant echo at the head of the delta is skipped when it
     textually equals our last reply (the backend already has that turn).
 
@@ -62,14 +72,22 @@ Reasoning (OpenCode ``reasoning`` parts <-> OpenAI ``reasoning_content``):
   finish reason still follows the final content or tool_calls turn.
   Multi-turn tool use preserves prior ``reasoning_content`` in the backend
   context as a separate ``[assistant reasoning]...[/assistant reasoning]``
-  section — never merged into visible ``[assistant]`` text, never written
-  to persistent memory, never stored as a separate digest-registry memory
-  object. The backend session natively retains the previous reasoning +
-  text-with-tool-call output, so delta prompts carry only the new tail
-  (assistant replay with IDs + tool result); the model thus receives prior
-  reasoning exactly once per continuation without redundant second
-  assistant events, while generated OpenAI call IDs survive unchanged for
-  tool-result association.
+  section on full replays — never merged into visible ``[assistant]`` text,
+  never written to persistent memory, never stored as a separate
+  digest-registry memory object. The backend session natively retains the
+  previous reasoning + text-with-tool-call output, so deduped delta prompts
+  carry only genuinely new tail state (minimal ``[assistant tool calls]``
+  ID replay + ``[tool result: name] (call id)`` + explicit
+  ``<result>``…``</result>`` wrapper); the model thus receives prior
+  reasoning exactly once per continuation (natively in the prefix, re-quoted
+  only when genuinely new) without redundant second assistant events, while
+  generated OpenAI call IDs survive unchanged for tool-result association.
+  Images (``image_url`` / ``input_image`` parts) are intentionally NOT
+  forwarded — replaced with ``[attached image omitted]`` (documented in
+  README; text behavior pinned by regression tests). A safe opt-in context
+  trace (``OPENCODE_PROXY_DEBUG=1``; lengths + hashes, never secrets;
+  ``OPENCODE_PROXY_VERBOSE_PAYLOADS=1`` for bounded previews) shows
+  REQUEST / SESSION / OUTBOUND / INBOUND per turn.
 
 Error semantics (never fabricate an answer):
 
@@ -420,21 +438,51 @@ def _render_tool_calls(tool_calls) -> str:
     return "[assistant tool calls]\n" + "\n".join(rendered)
 
 
+def format_tool_result(name: str, tcid: str, text: str) -> str:
+    """Render one tool message with explicit source/call delimiters.
+
+    Format (Objective 7 — unambiguous):
+
+        [tool result: {name}] (call {id})
+        <result>
+        {raw tool output, byte-preserved}
+        </result>
+
+    The ``<result>`` wrapper makes the source (tool name) and call
+    relationship obvious and prevents arbitrary tool output (JSON, JS,
+    HTML, CSS, terminal output, stack traces, logs, Markdown) from looking
+    like a new instruction. Ordinary source code is NOT escaped or altered
+    — it is preserved byte-for-byte inside the wrapper. The only edge is a
+    tool payload that itself contains ``</result>``; that sequence is
+    escaped as ``<\\/result>`` inside the wrapper so the outer delimiter
+    stays unambiguous (documented, minimal, reversible).
+    """
+    label = f"[tool result: {name}]" if name else "[tool result]"
+    if tcid:
+        label += f" (call {tcid})"
+    if text is None:
+        text = ""
+    # Minimal disambiguation: escape a literal closing tag inside payload.
+    safe = text.replace("</result>", "<\\/result>")
+    return f"{label}\n<result>\n{safe}\n</result>"
+
+
 def flatten_history(msgs) -> str:
     """Flatten the conversation into one labeled transcript. No size budget.
 
     Every turn is preserved in order: system (+developer), user, assistant
     (reasoning + content + tool calls), tool results (with tool name / call
-    id when provided). Reasoning is kept strictly separate from visible
-    content as ``[assistant reasoning]...[/assistant reasoning]`` — never
-    merged into ``[assistant]`` text, never written to persistent memory,
-    never stored as a separate digest-registry memory object. Its purpose
-    is strictly to preserve model context for the next reasoning/tool turn
-    (MiMo API: previous reasoning_content is retained during multi-turn
-    tool use). Empty turns carry no information and are skipped — but an
-    assistant tool-call message with empty ``content`` is NOT empty when it
-    carries tool_calls or reasoning. Nothing is ever truncated — Hermes'
-    ``messages`` array is authoritative.
+    id when provided, wrapped in explicit ``<result>`` delimiters).
+    Reasoning is kept strictly separate from visible content as
+    ``[assistant reasoning]...[/assistant reasoning]`` — never merged into
+    ``[assistant]`` text, never written to persistent memory, never stored
+    as a separate digest-registry memory object. Its purpose is strictly to
+    preserve model context for the next reasoning/tool turn (MiMo API:
+    previous reasoning_content is retained during multi-turn tool use).
+    Empty turns carry no information and are skipped — but an assistant
+    tool-call message with empty ``content`` is NOT empty when it carries
+    tool_calls or reasoning. Nothing is ever truncated — Hermes' ``messages``
+    array is authoritative.
     """
     blocks: list[tuple[bool, str]] = []  # (is_system, text)
     for m in msgs or []:
@@ -461,19 +509,96 @@ def flatten_history(msgs) -> str:
             elif not reasoning:
                 continue  # truly empty assistant turn: skip
         elif role == "tool":
-            name = m.get("name", "")
-            tcid = m.get("tool_call_id", "")
-            label = f"[tool result: {name}]" if name else "[tool result]"
-            if tcid:
-                label += f" (call {tcid})"
+            name = m.get("name", "") or ""
+            tcid = m.get("tool_call_id", "") or ""
             if text:
-                blocks.append((False, f"{label}\n{text}"))
+                blocks.append((False, format_tool_result(name, tcid, text)))
+            # Empty tool results carry no information; skipped (same as
+            # empty user turns). Non-empty results are never truncated.
         else:  # user and anything unknown
             if text:
                 blocks.append((False, f"[user]\n{text}"))
     system = [b for s, b in blocks if s]
     rest = [b for s, b in blocks if not s]
     return "\n\n".join(system + rest).strip()
+
+
+def flatten_delta(msgs, entry: dict | None) -> str:
+    """Flatten a delta slice WITHOUT duplicating backend-held prefix state.
+
+    The persistent OpenCode session already stores, as its prefix:
+
+      * the previous full/flattened user prompt (system + user turns), and
+      * the previous assistant response (reasoning part + text part with
+        the textual ``<tool_call>`` block).
+
+    Hermes replays that same assistant turn (reasoning_content + content +
+    tool_calls with OpenAI call IDs) at the head of the next request. Naively
+    re-serializing it would duplicate reasoning + visible content + tool-call
+    text a second time inside the new user prompt::
+
+        BACKEND: user / assistant-reasoning / assistant-tool-call-text
+        DELTA (naive): assistant-reasoning + assistant-tool-call + tool-result
+
+    Instead this helper keeps only genuinely NEW delta state:
+
+      * assistant messages: keep ``tool_calls`` (OpenAI IDs are protocol
+        state the backend never saw — required for tool-result association),
+        but DROP reasoning / visible content when they textually equal the
+        backend's stored last turn (``entry.last_reasoning`` /
+        ``entry.last_reply``). Genuinely new reasoning/content (differs from
+        stored) is kept.
+      * tool messages: always kept in full (new results, unambiguous
+        ``<result>`` wrapper with call ID).
+      * user messages: always kept in full (new instructions).
+      * system messages: kept if present (rare in delta; normally absent).
+
+    Full resyncs (no entry / digest divergence) MUST use
+    :func:`flatten_history` instead — everything is new to the fresh
+    session there.
+    """
+    if entry is None:
+        return flatten_history(msgs)
+    last_r = (entry.get("last_reasoning") or "")
+    last_c = (entry.get("last_reply") or "")
+    blocks: list[str] = []
+    for m in msgs or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        text = _text_of(m.get("content", ""))
+        if role in ("system", "developer"):
+            if text:
+                blocks.append(f"[system]\n{text}")
+        elif role == "assistant":
+            reasoning = _reasoning_of_msg(m)
+            calls = _render_tool_calls(m.get("tool_calls"))
+            keep_r = bool(reasoning and
+                          reasoning.strip() != (last_r or "").strip())
+            keep_t = bool(text and text.strip() != (last_c or "").strip())
+            if keep_r:
+                blocks.append(
+                    f"[assistant reasoning]\n{reasoning}\n[/assistant reasoning]")
+            if keep_t and calls:
+                blocks.append(f"[assistant]\n{text}\n{calls}")
+            elif keep_t:
+                blocks.append(f"[assistant]\n{text}")
+            elif calls:
+                # Duplicate reasoning/content stripped; IDs preserved.
+                blocks.append(f"[assistant]\n{calls}")
+            elif keep_r:
+                pass  # reasoning already emitted above
+            else:
+                continue  # pure echo of stored turn: nothing new
+        elif role == "tool":
+            name = m.get("name", "") or ""
+            tcid = m.get("tool_call_id", "") or ""
+            if text:
+                blocks.append(format_tool_result(name, tcid, text))
+        else:
+            if text:
+                blocks.append(f"[user]\n{text}")
+    return "\n\n".join(blocks).strip()
 
 
 def flatten_tail(msgs) -> str:
@@ -484,6 +609,11 @@ def flatten_tail(msgs) -> str:
     system label. Delta slices normally contain no system message at all —
     this helper only guards the rare case where a divergence replays a slice
     that still starts with system.
+
+    NOTE: append-only continuations should prefer :func:`flatten_delta`
+    (dedup against the stored prefix). This helper remains as the
+    non-deduping fallback for backward compatibility and for slices
+    without registry state.
     """
     return flatten_history(msgs)
 
@@ -567,12 +697,18 @@ class Registry:
         return best
 
     def record(self, digests: list[str], backend_kind: str, sid: str,
-               last_reply: str, tools_sig: str = "") -> dict:
+               last_reply: str, tools_sig: str = "",
+               last_reasoning: str = "") -> dict:
         entry = {
             "digests": list(digests),
             "backend": backend_kind,
             "sid": sid,
             "last_reply": last_reply,
+            # Previous assistant reasoning (content-only cursor, like
+            # last_reply). Stored so delta continuations can strip a replayed
+            # reasoning block that the backend session already holds
+            # natively — never a transcript copy, never persistent memory.
+            "last_reasoning": last_reasoning,
             # Request-level metadata (NOT part of the message digest): the
             # hash of this request's effective tools + tool_choice. A change
             # here must invalidate the session cursor even when the message
@@ -638,18 +774,20 @@ def plan_prompt(msgs, entry: dict | None) -> tuple[str, str, dict]:
     carries the full incoming digest list — the caller records it only
     after a successful completion (retries then replay the same tail).
 
-    Backend-session accounting (explicit): after the previous model
-    response the ``opencode serve`` session natively stores the reasoning
-    part + the text part containing the textual ``<tool_call>`` (or legacy
-    ``[tool_call]``) block. The next delta therefore primarily provides
-    the tool result (+ new information) with the OpenAI call ID preserved
-    in the textual replay (``(call call_...)``) so the relationship stays
-    unambiguous — it does NOT create a redundant second assistant event
-    in the backend session (prompts travel as user text, not as new
-    assistant messages). The prior reasoning thus reaches the model
-    exactly once per continuation: once natively in the session prefix,
-    once quoted in the delta tail when it is genuinely new (never
-    duplicated from the stored prefix, never merged into visible text).
+    Backend-session accounting (explicit, measured — not assumed): after
+    the previous model response the ``opencode serve`` session natively
+    stores the reasoning part + the text part containing the textual
+    ``<tool_call>`` (or legacy ``[tool_call]``) block. The next delta
+    therefore primarily provides the tool result (+ genuinely new tail
+    state) with the OpenAI call ID preserved verbatim (``(call call_...)``)
+    on both the minimal ``[assistant tool calls]`` replay AND the
+    ``[tool result: ...] (call call_...)`` label — it does NOT create a
+    redundant second assistant event in the backend session (prompts travel
+    as user text, not as new assistant messages). The prior reasoning thus
+    reaches the model exactly once per continuation: once natively in the
+    session prefix; the delta re-quotes it ONLY when it differs from the
+    stored ``last_reasoning`` cursor (genuinely new thinking), never by
+    blindly replaying the stored prefix, never merged into visible text.
     """
     digs = digests_of(msgs)
     if entry is None:
@@ -663,7 +801,16 @@ def plan_prompt(msgs, entry: dict | None) -> tuple[str, str, dict]:
         # Degenerate repeat (client re-sent an identical conversation):
         # regenerate from the last message rather than emitting nothing.
         tail = list(msgs[-1:])
-    return flatten_tail(tail), "delta", {"digests": digs}
+        return flatten_history(tail), "delta", {"digests": digs}
+    # Dedup delta: strip reasoning/visible echoes already held natively by
+    # the backend prefix; keep tool_calls IDs + tool results + new state.
+    prompt = flatten_delta(tail, entry)
+    if not prompt:
+        # Entire tail was a pure echo of stored state (e.g. assistant echo
+        # with stripped reasoning/content and no tool calls): fall back to
+        # the last message so we never emit an empty prompt.
+        prompt = flatten_history(list(msgs[-1:]))
+    return prompt, "delta", {"digests": digs}
 
 
 def tools_signature(tools_list, tool_choice) -> str:
@@ -711,6 +858,159 @@ def _incoming_has_reasoning(msgs) -> bool:
                 and _reasoning_of_msg(m):
             return True
     return False
+
+
+def _short_hash(text: str) -> str:
+    """First 8 hex chars of sha256 (for safe trace logging, not security)."""
+    try:
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:8]
+    except Exception:
+        return "?"
+
+
+def should_send_tool_block(*, mode: str, entry: dict | None,
+                           tools_list, tools_sig: str) -> bool:
+    """Whether the [client tools] contract block belongs in this prompt.
+
+    Objective 6: when the Hermes tool catalog has not changed, the backend
+    session already holds the contract from the initial creation / last
+    resync — resending a ~10 KB catalog on every append-only continuation
+    is redundant context. Send the block on resync (fresh session) or when
+    the signature differs from the stored entry; skip it on delta with an
+    unchanged signature. Never silently use stale definitions: a changed
+    signature forces a resync at the lookup layer, and this helper returns
+    True there so the new contract is explicitly supplied.
+    """
+    if not tools_list:
+        return False
+    if mode != "delta":
+        return True  # resync / first turn: fresh session needs contract
+    if entry is None:
+        return True
+    try:
+        return (entry.get("tools_sig", "") or "") != (tools_sig or "")
+    except Exception:
+        return True
+
+
+def build_context_trace(*, msgs, entry, mode: str, prompt: str,
+                        tools_list, tool_choice, tools_sig: str,
+                        sid: str | None,
+                        translator=None,
+                        finish_reason: str = "") -> dict:
+    """Safe, opt-in trace of the context transformation (no secrets).
+
+    REQUEST: message count, per-role counts, tools count, tool_choice
+      (stringified), reasoning presence (bool), per-message content
+      lengths + short hashes (never full bodies).
+    SESSION: backend session id (last 8 chars), digest match (bool +
+      stored prefix length), append-only vs full resync, tools signature
+      (short), whether previous tool state exists (entry present).
+    OUTBOUND: full replay vs delta, prompt length + hash, serialized tool
+      result count + lengths, serialized tool call count, reasoning
+      inclusion (bool), tool-definition inclusion (bool).
+    INBOUND (when translator supplied): reasoning chars emitted, content
+      chars emitted, tool-call parser events (count), finish reason.
+
+    Never includes: Authorization headers, API keys, cookies, credentials,
+    environment variables, or arbitrary secrets. Content bodies are
+    represented by lengths + hashes by default; full payloads only appear
+    when VERBOSE_PAYLOADS is explicitly enabled (controlled local debug).
+    """
+    try:
+        roles: dict[str, int] = {}
+        sizes: list[int] = []
+        hashes: list[str] = []
+        reasoning_present = False
+        tool_msg_count = 0
+        asst_call_count = 0
+        for m in msgs or []:
+            if not isinstance(m, dict):
+                continue
+            r = str(m.get("role", "?"))
+            roles[r] = roles.get(r, 0) + 1
+            t = _text_of(m.get("content", ""))
+            sizes.append(len(t))
+            hashes.append(_short_hash(t))
+            if r == "assistant" and _reasoning_of_msg(m):
+                reasoning_present = True
+            if r == "tool":
+                tool_msg_count += 1
+            if r == "assistant" and m.get("tool_calls"):
+                tc = m.get("tool_calls")
+                if isinstance(tc, list):
+                    asst_call_count += len(tc)
+        digs = digests_of(msgs)
+        stored = entry.get("digests", []) if isinstance(entry, dict) else []
+        digest_match = bool(entry) and digs[: len(stored)] == stored
+        prompt_text = prompt or ""
+        # Count serialized markers in the OUTBOUND prompt (not secrets).
+        n_results = prompt_text.count("<result>")
+        n_asst_calls = prompt_text.count("[assistant tool calls]")
+        reasoning_included = "[assistant reasoning]" in prompt_text
+        tools_included = "[client tools]" in prompt_text
+        trace: dict = {
+            "request": {
+                "message_count": len(msgs or []),
+                "roles": roles,
+                "tools_count": len(tools_list) if isinstance(tools_list, list) else 0,
+                "tool_choice": json.dumps(tool_choice, default=str)[:120],
+                "reasoning_present": reasoning_present,
+                "content_lengths": sizes,
+                "content_hashes": hashes,
+                "assistant_tool_calls": asst_call_count,
+                "tool_messages": tool_msg_count,
+            },
+            "session": {
+                "sid_short": (sid[-8:] if isinstance(sid, str) and sid else "new"),
+                "digest_match": digest_match,
+                "stored_prefix_len": len(stored),
+                "mode": mode,  # "delta" = append-only, "resync" = full replay
+                "tools_sig_short": (tools_sig[:8] if isinstance(tools_sig, str) else "?"),
+                "tools_sig_match": bool(entry) and (entry.get("tools_sig", "") == tools_sig),
+                "has_entry": bool(entry),
+                "health": (entry.get("health", "?") if isinstance(entry, dict) else "?"),
+            },
+            "outbound": {
+                "kind": "full-replay" if mode != "delta" else "delta",
+                "prompt_chars": len(prompt_text),
+                "prompt_hash": _short_hash(prompt_text),
+                "serialized_tool_results": n_results,
+                "serialized_tool_calls": n_asst_calls,
+                "reasoning_included": reasoning_included,
+                "tool_definition_included": tools_included,
+            },
+            "inbound": {
+                "finish_reason": finish_reason,
+            },
+        }
+        if translator is not None:
+            try:
+                trace["inbound"].update({
+                    "reasoning_chars": len(getattr(translator, "reasoning_emitted", "") or ""),
+                    "content_chars": len(getattr(translator, "content_emitted", "") or ""),
+                    "tool_calls": int(getattr(translator, "call_index", 0) or 0),
+                })
+            except Exception:
+                pass
+        if VERBOSE_PAYLOADS:
+            # Explicit opt-in only: full prompt may contain private tool
+            # results / source. Never enabled by default.
+            trace["outbound"]["prompt_preview"] = prompt_text[:2000]
+        return trace
+    except Exception as e:
+        return {"trace_error": str(e)[:200]}
+
+
+def log_context_trace(trace: dict, request_id: str = "") -> None:
+    """Emit a safe context trace via debug_log (gated behind DEBUG)."""
+    if not DEBUG:
+        return
+    try:
+        # No secrets: trace already contains only counts/lengths/hashes.
+        debug_log(f"context-trace req={request_id} {json.dumps(trace, default=str)}")
+    except Exception:
+        pass
 
 
 def _debug_tool_turn(*, model: str, transport: str, mode: str,
@@ -2417,9 +2717,15 @@ def make_app(cli: str, work_dir: str, *,
         state["backend_kind"] = "run"
         return run_backend, "run"
 
-    def build_prompt(msgs, entry, tools_list, tool_choice) -> tuple[str, str, dict]:
+    def build_prompt(msgs, entry, tools_list, tool_choice,
+                     tools_sig: str = "") -> tuple[str, str, dict]:
         prompt, mode, rec = plan_prompt(msgs, entry)
-        if tools_list:
+        # Objective 6: the [client tools] contract lives in the backend
+        # prefix after the first turn. Resending it on every append-only
+        # delta wastes context; only (re)send on resync or contract change.
+        if should_send_tool_block(mode=mode, entry=entry,
+                                  tools_list=tools_list,
+                                  tools_sig=tools_sig):
             block = format_client_tools(tools_list, tool_choice)
             if block:
                 prompt = f"{prompt}\n\n{block}"
@@ -2430,7 +2736,18 @@ def make_app(cli: str, work_dir: str, *,
         backend, kind = await get_backend()
         digs = digests_of(msgs)
         entry = lookup_entry(registry, digs, kind, tools_sig)
-        prompt, mode, rec = build_prompt(msgs, entry, tools_list, tool_choice)
+        prompt, mode, rec = build_prompt(msgs, entry, tools_list, tool_choice,
+                                         tools_sig)
+        # Optional safe context trace (DEBUG-gated, no secrets).
+        try:
+            _trace = build_context_trace(
+                msgs=msgs, entry=entry, mode=mode, prompt=prompt,
+                tools_list=tools_list, tool_choice=tool_choice,
+                tools_sig=tools_sig,
+                sid=(entry.get("sid") if isinstance(entry, dict) else None))
+            log_context_trace(_trace, request_id="blocking")
+        except Exception:
+            pass
         bridge = bool(tools_list)
 
         if kind == "serve":
@@ -2454,7 +2771,8 @@ def make_app(cli: str, work_dir: str, *,
             else:
                 text, calls = raw, []
             registry.record(rec["digests"], kind, sid, text,
-                            tools_sig=tools_sig)
+                            tools_sig=tools_sig,
+                            last_reasoning=raw_reasoning or "")
             if calls:
                 log("tool_calls: " + ", ".join(
                     f"{(c.get('function') or {}).get('name', '?')}={c.get('id', '?')}"
@@ -2480,7 +2798,8 @@ def make_app(cli: str, work_dir: str, *,
         else:
             text, calls = raw, []
         registry.record(rec["digests"], kind, new_sid or sid or "", text,
-                        tools_sig=tools_sig)
+                        tools_sig=tools_sig,
+                        last_reasoning=raw_reasoning or "")
         if calls:
             log("tool_calls: " + ", ".join(
                 f"{(c.get('function') or {}).get('name', '?')}={c.get('id', '?')}"
@@ -2539,7 +2858,16 @@ def make_app(cli: str, work_dir: str, *,
             backend, kind = await get_backend()
             entry = lookup_entry(registry, digs, kind, tools_sig)
             prompt, mode, rec = build_prompt(msgs, entry, tools_list,
-                                             tool_choice)
+                                             tool_choice, tools_sig)
+            try:
+                _trace = build_context_trace(
+                    msgs=msgs, entry=entry, mode=mode, prompt=prompt,
+                    tools_list=tools_list, tool_choice=tool_choice,
+                    tools_sig=tools_sig,
+                    sid=(entry.get("sid") if isinstance(entry, dict) else None))
+                log_context_trace(_trace, request_id=cid)
+            except Exception:
+                pass
             sid = entry["sid"] if (entry and mode == "delta") else None
             if kind == "serve" and sid is None:
                 sid = await backend.create_session(model)
@@ -2792,7 +3120,8 @@ def make_app(cli: str, work_dir: str, *,
                                  if _divergent else "ambiguous-tools"))
                 else:
                     registry.record(rec["digests"], kind, sid, text,
-                                    tools_sig=tools_sig)
+                                    tools_sig=tools_sig,
+                                    last_reasoning=reasoning or "")
                 tokens = info.get("tokens") or {}
                 slog(cid, "active",
                      sid=_sid_short, events=events_seen,
@@ -2831,7 +3160,8 @@ def make_app(cli: str, work_dir: str, *,
                 for payload in payloads:
                     await send(payload)
                 registry.record(rec["digests"], kind, new_sid or "", text,
-                                tools_sig=tools_sig)
+                                tools_sig=tools_sig,
+                                last_reasoning=reasoning or "")
                 tokens = {}
                 _debug_tool_turn(
                     model=model, transport="run", mode=mode,
@@ -2848,6 +3178,15 @@ def make_app(cli: str, work_dir: str, *,
                 log(f"tool_calls: {tr.call_index} (finish=tool_calls)")
             if tr.reasoning_emitted:
                 log(f"reasoning: {len(tr.reasoning_emitted)} chars")
+            try:
+                _done_trace = build_context_trace(
+                    msgs=msgs, entry=entry, mode=mode, prompt=prompt,
+                    tools_list=tools_list, tool_choice=tool_choice,
+                    tools_sig=tools_sig, sid=sid,
+                    translator=tr, finish_reason=finish)
+                log_context_trace(_done_trace, request_id=cid)
+            except Exception:
+                pass
             await resp.write_eof()
             slog(cid, "done",
                  sid=_sid_short, content=len(tr.content_emitted),

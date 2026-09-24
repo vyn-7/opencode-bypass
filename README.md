@@ -183,38 +183,74 @@ the full `messages` array every turn; the proxy keeps only an in-memory
 conversation to a backend session id — cursors, never a transcript copy:
 
 1. **First turn** → new `opencode serve` session, full authoritative
-   transcript flattened into one labeled prompt.
-2. **Append-only turns** → *delta* prompt: only the new messages are sent;
-   the backend already holds the prefix. Client-side assistant echoes of our
-   last reply are skipped (the backend has that turn too). Provider prompt
-   caching keeps input tokens flat (~18k scaffold, ~40–60 delta input).
-3. **History compression / edit / rollback** (digest divergence) → fresh
-   session + full authoritative replay. Correctness always wins over tokens.
+   transcript flattened into one labeled prompt (plus `[client tools]`
+   contract when tools are present).
+2. **Append-only turns** → *deduped delta* prompt: only genuinely new tail
+   state is sent; the backend already holds the prefix. Assistant
+   `reasoning_content` / visible-content echoes that equal the stored
+   `last_reasoning` / `last_reply` cursors are stripped (the backend holds
+   that reasoning + tool-call text natively) — only the minimal
+   `[assistant tool calls]` replay with verbatim OpenAI call IDs plus the
+   new `[tool result: …] (call …)` block is sent. The `[client tools]`
+   catalog is NOT resent when its `tools_signature` is unchanged (it lives
+   in the backend prefix); a changed signature forces a full resync with
+   the new contract. Provider prompt caching keeps input tokens flat.
+3. **History compression / edit / rollback** (digest divergence), proxy
+   restart (registry loss), missing/tainted backend session, or tools
+   change → fresh session + full authoritative replay preserving
+   `reasoning_content`, `tool_calls`, `tool_call_id`s, tool results, and
+   ordering. Correctness always wins over tokens.
 4. **Serve unavailable** → automatic fallback to `opencode run` with
    session continuation (`run -s SID`), same digest logic, prompts split at
    argv space boundaries (byte-exact under `run`'s single-space join).
 
-Three details matter for agentic clients:
+Agentic details (pinned by `tests/test_context_fidelity.py`):
 
-1. **Tool calls are serialized, not dropped.** An assistant turn that only
-   carries `tool_calls` flattens to `[assistant tool calls]` with each
-   `- name(args)` line, and tool results keep their name and call id
-   (`[tool result: read] (call call_…)`), so the model sees *which action
-   produced which result*.
+1. **Tool calls are serialized, not dropped — and actually consumed.**
+   An assistant turn flattens to `[assistant tool calls]` with each
+   `- name(args) (call call_…)` line (IDs preserved verbatim, never
+   regenerated; ordering preserved). Tool results use an unambiguous
+   wrapper so the model can distinguish result from instruction:
+   `[tool result: read_file] (call call_123)` + `<result>` … `</result>`
+   (raw output byte-preserved: JSON/JS/HTML/CSS/terminal/stack/logs/
+   Markdown; a literal `</result>` inside payload is escaped as
+   `<\/result>`). Deterministic mock integration tests prove the final
+   answer is *derived from* the tool value (`UNIQUE_TOOL_VALUE_94721`,
+   `ORBIT-731`, `ALPHA/BETA/GAMMA` chain) — not merely present in logs.
 2. **Nothing is ever truncated.** There is no char budget, no trimming, no
-   adapter-generated summary. A 300k-char tool result reaches the model in
-   full (pinned by unit tests). Inbound body limit is 64 MB.
+   adapter-generated summary. 1 KB / 50 KB / 300 KB tool results reach the
+   model in full on the continuation path (pinned by tests). Inbound body
+   limit is 64 MB.
 3. **Both API paths are served** (`/v1/chat/completions` and
    `/chat/completions`), and every SSE stream opens with a role chunk and
-   closes with `finish_reason` + `[DONE]` — the exact contract Hermes
-   requires.
+   closes with `finish_reason` (`tool_calls` vs `stop`) + `[DONE]` —
+   `reasoning_content` / `content` / `tool_calls` never mixed; provider
+   errors never fabricated as `stop`.
+4. **Images are NOT forwarded.** Multimodal `content` parts of type
+   `image_url` / `input_image` are replaced with the explicit placeholder
+   `[attached image omitted]` (text parts preserved verbatim). This is
+   intentional compatibility behavior — the proxy never invents fake image
+   descriptions. Text-only behavior is pinned by regression tests.
+5. **Debug context trace (opt-in).** `OPENCODE_PROXY_DEBUG=1` logs a safe
+   per-turn trace: request (counts/roles/tools/reasoning-presence/sizes/
+   hashes), session (sid-short/digest-match/delta-vs-resync/tools-sig),
+   outbound (replay-vs-delta/result+call counts/reasoning+tools inclusion/
+   prompt hash), inbound (reasoning/text/tool-call counts/finish). Only
+   lengths + short hashes by default — never API keys, auth, cookies, or
+   full bodies. `OPENCODE_PROXY_VERBOSE_PAYLOADS=1` adds a bounded preview
+   for controlled local debugging.
 
 Memory + tool-bridge + reasoning behavior is pinned by
-`tests/test_memory.py` (unit) and `tests/test_stream.py` (wire-level SSE
+`tests/test_memory.py` (unit), `tests/test_stream.py` (wire-level SSE
 with a mocked EventHub — reasoning channels, race buffering, structured
-mid-stream errors) — stdlib `unittest`, no network or CLI needed:
+mid-stream errors), `tests/test_tool_loop.py` (tool protocol), and
+`tests/test_context_fidelity.py` (end-to-end consumption, multi-tool,
+IDs, dedup, resync, restart, large results, trace, optional live model) —
+stdlib `unittest`, no network or CLI needed:
 `.venv/bin/python -m unittest discover -s tests`, plus live turn-2 recall
-in `./test_proxy.sh` / `.\test_proxy.ps1`.
+in `./test_proxy.sh` / `.\test_proxy.ps1`. Optional live-model proof:
+`OPENCODE_LIVE_TEST=1 OPENCODE_PROXY_URL=… .venv/bin/python -m unittest
+tests.test_context_fidelity.TestLiveBackend -v`.
 
 ### Free-tier constraints (measured — do not "optimize" into these)
 

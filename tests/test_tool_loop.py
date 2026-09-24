@@ -288,7 +288,7 @@ class TestReasoningAndFlatten(unittest.TestCase):
         out = flatten_history(msgs)
         self.assertIn("(call call_A)", out)
         self.assertIn("(call call_B)", out)
-        self.assertIn("[tool result: b] (call call_B)\nresult-B", out)
+        self.assertIn("[tool result: b] (call call_B)\n<result>\nresult-B\n</result>", out)
         # ordering: tool calls before tool result
         self.assertLess(out.index("(call call_B)"),
                         out.index("[tool result: b]"))
@@ -651,32 +651,31 @@ class TestFullLoop(WireLoopCase):
         # ---- continuation-context checks (prompt sent to backend) ----
         self.assertGreaterEqual(len(self.captured_prompts), 2)
         prompt2 = self.captured_prompts[-1]
-        # reasoning preserved, separate from visible content
-        self.assertIn("[assistant reasoning]\nNeed weather for Paris.\n"
-                      "[/assistant reasoning]", prompt2)
-        # tool_calls preserved with EXACT id (not regenerated)
+        # Objective 4/5: delta must NOT duplicate reasoning already held
+        # natively by the backend prefix (reasoning1 == stored cursor).
+        self.assertNotIn("Need weather for Paris.", prompt2)
+        self.assertNotIn("[assistant reasoning]", prompt2)
+        # tool_calls preserved with EXACT id (not regenerated) via the
+        # minimal [assistant tool calls] replay (IDs are protocol state).
         self.assertIn(f"(call {call_id})", prompt2)
         self.assertIn("get_weather", prompt2)
-        self.assertIn("Paris", prompt2)
-        # tool result associated with same call, ordering preserved
+        # tool result associated with same call, unambiguous wrapper,
+        # ordering preserved (calls before result).
         self.assertIn(f"[tool result: get_weather] (call {call_id})\n"
-                      f"{tool_output}", prompt2)
+                      f"<result>\n{tool_output}\n</result>", prompt2)
         self.assertLess(prompt2.index(f"(call {call_id})"),
                         prompt2.index(f"[tool result: get_weather]"))
-        # visible assistant content still present, no markers leaked
-        self.assertIn(content1.strip().split()[0], prompt2)
-        # transcript portion (before the instructional [client tools]
-        # example, which legitimately contains <tool_call>) must not leak
-        # backend tool markers as visible content
-        transcript_part = prompt2.split("[client tools]")[0]
-        self.assertNotIn(TOOL_OPEN_XML, transcript_part)
-        self.assertNotIn(TOOL_CLOSE_XML, transcript_part)
-        self.assertNotIn(TOOL_OPEN_BRACKET, transcript_part)
-        self.assertNotIn(TOOL_CLOSE_BRACKET, transcript_part)
+        # Objective 6: unchanged tool catalog must NOT be resent on delta.
+        self.assertNotIn("[client tools]", prompt2)
+        # No backend tool markers leak as visible content (no [client
+        # tools] block on delta, so check the whole prompt).
+        self.assertNotIn(TOOL_OPEN_XML, prompt2)
+        self.assertNotIn(TOOL_CLOSE_XML, prompt2)
+        self.assertNotIn(TOOL_OPEN_BRACKET, prompt2)
+        self.assertNotIn(TOOL_CLOSE_BRACKET, prompt2)
         # the delta for turn 2 must be a delta (prefix matched), not resync
-        # (resync would repeat [system]; delta has no system here)
-        # (no system in these msgs, so check it contains tool result)
         self.assertIn("[tool result", prompt2)
+        self.assertIn("<result>", prompt2)
 
     async def test_blocking_full_loop_ids_and_reasoning(self):
         tools = [{"type": "function", "function": {
@@ -723,10 +722,12 @@ class TestFullLoop(WireLoopCase):
         self.assertEqual(data2["choices"][0]["message"]["reasoning_content"],
                          "think-2")
         prompt2 = self.captured_prompts[-1]
-        self.assertIn("think-1", prompt2)
+        # Deduped delta: stored reasoning/content stripped, IDs + result kept.
+        self.assertNotIn("think-1", prompt2)
         self.assertIn(f"(call {cid})", prompt2)
-        self.assertIn(cargs, prompt2)
-        self.assertIn(f"[tool result: {cname}] (call {cid})", prompt2)
+        self.assertIn(f"[assistant tool calls]", prompt2)
+        self.assertIn(f"[tool result: {cname}] (call {cid})\n<result>\na.txt\n</result>", prompt2)
+        self.assertNotIn("[client tools]", prompt2)
 
 
 class TestPromptAndDebug(unittest.TestCase):

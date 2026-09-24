@@ -136,12 +136,13 @@ class TestFlattenHistory(unittest.TestCase):
         out = flatten_history(msgs)
         self.assertIn("read", out)
         self.assertIn("a.txt", out)
-        self.assertIn("[tool result: read]\nfile bytes", out)
+        # Unambiguous wrapper (Objective 7): label + <result> delimiters.
+        self.assertIn("[tool result: read]\n<result>\nfile bytes\n</result>", out)
         self.assertIn("The file says hi.", out)
 
     def test_tool_result_without_name(self):
         out = flatten_history([{"role": "tool", "content": "42"}])
-        self.assertIn("[tool result]\n42", out)
+        self.assertIn("[tool result]\n<result>\n42\n</result>", out)
 
     def test_empty_turns_skipped(self):
         out = flatten_history([
